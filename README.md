@@ -11,11 +11,13 @@ sudo apt-get install pulseaudio
 ```
 
 # For Arch Linux:
+```
 sudo pacman -S python-pip
 sudo pacman -S python-pyaudio
 sudo pacman -S portaudio
 sudo pacman -S xclip
 sudo pacman -S pulseaudio
+```
 Then run `python linux.py`
 
 
