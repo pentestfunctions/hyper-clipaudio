@@ -23,6 +23,8 @@ Hyper-ClipAudio is designed to bridge the functionality gap in Hyper-V basic ses
 - 🖥️ System tray integration
 - 📊 Connection status monitoring
 
+> Mainly using pyaudio & xsel
+
 ## 🚀 Quick Start
 
 ### Linux (Host VM) Setup
