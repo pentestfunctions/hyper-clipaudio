@@ -6,6 +6,10 @@
 
 > Restore clipboard synchronization and audio streaming functionality to Hyper-V basic sessions without compromising performance.
 
+<p align="center">
+  <img src="https://github.com/pentestfunctions/hyper-clipaudio/blob/main/images/readme_images.png">
+</p>
+
 ## 🎯 Overview
 
 Hyper-ClipAudio is designed to bridge the functionality gap in Hyper-V basic sessions. While Enhanced sessions provide audio and clipboard support through RDP, they often come with performance penalties. This project enables these features in basic sessions while maintaining optimal performance.
