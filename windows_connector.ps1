@@ -3,6 +3,17 @@ param(
     [string]$ServerIP
 )
 
+# Hide the PowerShell Console
+Add-Type -Name Window -Namespace Console -MemberDefinition '
+[DllImport("Kernel32.dll")]
+public static extern IntPtr GetConsoleWindow();
+[DllImport("user32.dll")]
+public static extern bool ShowWindow(IntPtr hWnd, Int32 nCmdShow);
+'
+$consolePtr = [Console.Window]::GetConsoleWindow()
+[Console.Window]::ShowWindow($consolePtr, 0) # 0 = hide
+
+
 if (-Not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')) {
     if ([int](Get-CimInstance -Class Win32_OperatingSystem | Select-Object -ExpandProperty BuildNumber) -ge 6000) {
         $CommandLine = "-File `"" + $MyInvocation.MyCommand.Path + "`" " + $MyInvocation.UnboundArguments
@@ -127,172 +138,212 @@ function Kill-AllVLC {
     Write-Host "All VLC processes have been killed."
 }
 
+# Colors
+$darkBlue = [System.Drawing.Color]::FromArgb(45, 66, 99)
+$lightBlue = [System.Drawing.Color]::FromArgb(92, 164, 169)
+$titleBarColor = [System.Drawing.Color]::FromArgb(35, 50, 75)
+$buttonColor = [System.Drawing.Color]::FromArgb(65, 105, 225)
+$hoverColor = [System.Drawing.Color]::FromArgb(70, 130, 255)
+$white = [System.Drawing.Color]::White
+
 function Show-MainForm {
+
+    # Create the form
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = "Audio & Clipboard Sync"
-    $form.Size = New-Object System.Drawing.Size($WINDOW_WIDTH, $WINDOW_HEIGHT)
+    $form.Text = "Audio Clipboard Sync"
+    $form.Size = New-Object System.Drawing.Size(400, 300)
     $form.StartPosition = "CenterScreen"
-    $form.FormBorderStyle = "FixedSingle"
+    $form.BackColor = $darkBlue
+    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
     $form.MaximizeBox = $false
-    $form.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#1E1E1E")
-    $form.ForeColor = [System.Drawing.Color]::White
-    $form.Font = New-Object System.Drawing.Font("Segoe UI", 10)
-    
-    # Calculate positions
-    [int]$currentY = $PADDING
+    $form.Padding = New-Object System.Windows.Forms.Padding(0)
+    $form.ShowInTaskbar = $true
+    $form.MinimizeBox = $true
 
-    # Title Label
-    $titleLabel = New-Object System.Windows.Forms.Label
-    $titleLabel.Text = "Audio & Clipboard Sync"
-    $titleLabel.AutoSize = $true
-    $titleLabel.Font = New-Object System.Drawing.Font("Segoe UI", 20, [System.Drawing.FontStyle]::Bold)
-    $titleLabel.ForeColor = [System.Drawing.Color]::White
-    # Calculate center position for title
-    $titleLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
-    [int]$titleX = ($WINDOW_WIDTH - $titleLabel.PreferredWidth) / 2
-    $titleLabel.Location = New-Object System.Drawing.Point($titleX, $currentY)
-    $form.Controls.Add($titleLabel)
-    
-    $currentY = $currentY + $titleLabel.PreferredHeight + ([int]($PADDING * 1.5))
-
-    # IP Label
-    $label = New-Object System.Windows.Forms.Label
-    $label.Text = "Server IP Address:"
-    $label.AutoSize = $true
-    $label.ForeColor = [System.Drawing.Color]::White
-    $label.Font = New-Object System.Drawing.Font("Segoe UI", 11)
-    # Calculate center position for IP label
-    $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
-    [int]$labelX = ($WINDOW_WIDTH - $label.PreferredWidth) / 2
-    $label.Location = New-Object System.Drawing.Point($labelX, $currentY)
-    $form.Controls.Add($label)
-    
-    $currentY = $currentY + $label.PreferredHeight + 8
-
-    # Create ComboBox for IP selection with manual entry
-    $comboBox = New-Object System.Windows.Forms.ComboBox
-    $comboBox.Location = New-Object System.Drawing.Point($PADDING, $currentY)
-    [int]$comboBoxWidth = $WINDOW_WIDTH - ($PADDING * 6)  # Make room for scan button
-    $comboBox.Width = $comboBoxWidth
-    $comboBox.Height = $CONTROL_HEIGHT
-    $comboBox.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#2D2D2D")
-    $comboBox.ForeColor = [System.Drawing.Color]::White
-    $comboBox.Font = New-Object System.Drawing.Font("Segoe UI", 12)
-    $comboBox.FlatStyle = "Flat"
-    $comboBox.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDown
-    $form.Controls.Add($comboBox)
-
-    # Scan Button
-    $scanButton = New-Object System.Windows.Forms.Button
-    [int]$scanButtonWidth = ($PADDING * 6)
-    [int]$scanButtonX = $WINDOW_WIDTH - $scanButtonWidth
-    $scanButton.Location = New-Object System.Drawing.Point($scanButtonX, $currentY)
-    $scanButton.Width = $scanButtonWidth
-    $scanButton.Height = $CONTROL_HEIGHT
-    $scanButton.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#404040")
-    $scanButton.ForeColor = [System.Drawing.Color]::White
-    $scanButton.FlatStyle = "Flat"
-    $scanButton.Text = "Scan"  # Unicode refresh symbol
-    $scanButton.Font = New-Object System.Drawing.Font("Segoe UI", 12)
-    $form.Controls.Add($scanButton)
-
-    $currentY = $currentY + $CONTROL_HEIGHT + $PADDING
-
-    # Status Label
-    $statusLabel = New-Object System.Windows.Forms.Label
-    $statusLabel.Text = "Status: Not Connected"
-    $statusLabel.AutoSize = $true
-    $statusLabel.Location = New-Object System.Drawing.Point($PADDING, $currentY)
-    $statusLabel.ForeColor = [System.Drawing.Color]::Gray
-    $statusLabel.Font = New-Object System.Drawing.Font("Segoe UI", 11)
-    $form.Controls.Add($statusLabel)
-    
-    $currentY = $currentY + $statusLabel.PreferredHeight + ([int]($PADDING * 1.5))
-
-    # Button container panel for better alignment
-    $buttonPanel = New-Object System.Windows.Forms.Panel
-    $buttonPanel.Location = New-Object System.Drawing.Point($PADDING, $currentY)
-    $buttonPanel.Width = $WINDOW_WIDTH - ($PADDING * 2)
-    $buttonPanel.Height = $BUTTON_HEIGHT
-    $buttonPanel.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#1E1E1E")
-    $form.Controls.Add($buttonPanel)
-
-    # Calculate button widths and spacing with smaller width
-    [int]$buttonWidth = [Math]::Floor($buttonPanel.Width * 0.3)  # 30% of panel width for each button
-    [int]$totalButtonsWidth = ($buttonWidth * 2) + $PADDING     # Total width of both buttons plus padding
-    [int]$startX = ($buttonPanel.Width - $totalButtonsWidth) / 2  # Center point minus half of total button width
-
-    # Start Button
-    $startButton = New-Object System.Windows.Forms.Button
-    $startButton.Text = "Start Services"
-    $startButton.Location = New-Object System.Drawing.Point($startX, 0)
-    $startButton.Width = $buttonWidth
-    $startButton.Height = $BUTTON_HEIGHT
-    $startButton.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#007ACC")
-    $startButton.ForeColor = [System.Drawing.Color]::White
-    $startButton.FlatStyle = "Flat"
-    $startButton.Font = New-Object System.Drawing.Font("Segoe UI", 11)
-    $buttonPanel.Controls.Add($startButton)
-
-    # Stop Button
-    $stopButton = New-Object System.Windows.Forms.Button
-    $stopButton.Text = "Stop Services"
-    [int]$stopButtonX = $startX + $buttonWidth + $PADDING
-    $stopButton.Location = New-Object System.Drawing.Point($stopButtonX, 0)
-    $stopButton.Width = $buttonWidth
-    $stopButton.Height = $BUTTON_HEIGHT
-    $stopButton.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#CC2222")
-    $stopButton.ForeColor = [System.Drawing.Color]::White
-    $stopButton.FlatStyle = "Flat"
-    $stopButton.Font = New-Object System.Drawing.Font("Segoe UI", 11)
-    $stopButton.Enabled = $false
-    $buttonPanel.Controls.Add($stopButton)
-
-    # Create NotifyIcon with modern context menu
+    # Create NotifyIcon (System Tray Icon)
     $notifyIcon = New-Object System.Windows.Forms.NotifyIcon
-    $notifyIcon.Icon = [System.Drawing.SystemIcons]::Application
-    $notifyIcon.Text = "Audio & Clipboard Sync"
     $notifyIcon.Visible = $true
+    $notifyIcon.Text = "Audio Clipboard Sync"
+    $notifyIcon.Icon = [System.Drawing.SystemIcons]::Information
 
     # Create context menu for NotifyIcon
     $contextMenu = New-Object System.Windows.Forms.ContextMenuStrip
-    $contextMenu.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#2D2D2D")
-    $contextMenu.ForeColor = [System.Drawing.Color]::White
-    $contextMenu.Font = New-Object System.Drawing.Font("Segoe UI", 9)
 
-    $showMenuItem = New-Object System.Windows.Forms.ToolStripMenuItem("Show Window")
-    $startMenuItem = New-Object System.Windows.Forms.ToolStripMenuItem("Start Services")
-    $stopMenuItem = New-Object System.Windows.Forms.ToolStripMenuItem("Stop Services")
-    $exitMenuItem = New-Object System.Windows.Forms.ToolStripMenuItem("Exit")
+    # Status menu item (non-clickable)
+    $statusMenuItem = New-Object System.Windows.Forms.ToolStripMenuItem
+    $statusMenuItem.Text = "Status: Disconnected"
+    $statusMenuItem.Enabled = $false
+    $contextMenu.Items.Add($statusMenuItem)
 
-    # Configure menu items
-    @($showMenuItem, $startMenuItem, $stopMenuItem, $exitMenuItem) | ForEach-Object {
-        $_.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#2D2D2D")
-        $_.ForeColor = [System.Drawing.Color]::White
+    $separator = New-Object System.Windows.Forms.ToolStripSeparator
+    $contextMenu.Items.Add($separator)
+
+    $showMenuItem = New-Object System.Windows.Forms.ToolStripMenuItem
+    $showMenuItem.Text = "Show Window"
+    $contextMenu.Items.Add($showMenuItem)
+
+    $exitMenuItem = New-Object System.Windows.Forms.ToolStripMenuItem
+    $exitMenuItem.Text = "Exit"
+    $contextMenu.Items.Add($exitMenuItem)
+
+    # Assign context menu to notify icon
+    $notifyIcon.ContextMenuStrip = $contextMenu
+
+    $titleBar = New-Object System.Windows.Forms.Panel
+    $titleBar.Size = New-Object System.Drawing.Size(400, 30)
+    $titleBar.Location = New-Object System.Drawing.Point(0, 0)
+    $titleBar.BackColor = $titleBarColor
+    $form.Controls.Add($titleBar)
+
+    # Add drag
+    $titleBar.Add_MouseDown({
+        if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
+            $script:mouseDown = $true
+            $script:lastLocation = $_.Location
+        }
+    })
+    $titleBar.Add_MouseMove({
+        if ($script:mouseDown) {
+            $form.Location = New-Object System.Drawing.Point(
+                ($form.Location.X + $_.X - $script:lastLocation.X),
+                ($form.Location.Y + $_.Y - $script:lastLocation.Y))
+        }
+    })
+    $titleBar.Add_MouseUp({ $script:mouseDown = $false })
+
+    $titleText = New-Object System.Windows.Forms.Label
+    $titleText.Text = "Audio Clipboard Sync"
+    $titleText.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+    $titleText.ForeColor = $white
+    $titleText.AutoSize = $true
+    $titleText.Location = New-Object System.Drawing.Point(10, 7)
+    $titleBar.Controls.Add($titleText)
+
+    # Close button with Unicode
+    $closeButton = New-Object System.Windows.Forms.Label
+    $closeButton.Text = [char]0x2716
+    $closeButton.Size = New-Object System.Drawing.Size(30, 30)
+    $closeButton.Location = New-Object System.Drawing.Point(370, 0)
+    $closeButton.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+    $closeButton.ForeColor = $white
+    $closeButton.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $closeButton.Add_Click({ 
+        $form.Hide()
+        $notifyIcon.Visible = $true
+        $notifyIcon.ShowBalloonTip(2000, "Audio Clipboard Sync", "Application minimized to tray", [System.Windows.Forms.ToolTipIcon]::Info)
+    })
+    $closeButton.Add_MouseEnter({ 
+        $this.BackColor = [System.Drawing.Color]::Red
+        $this.Cursor = [System.Windows.Forms.Cursors]::Hand
+    })
+    $closeButton.Add_MouseLeave({ 
+        $this.BackColor = $titleBarColor
+    })
+    $titleBar.Controls.Add($closeButton)
+
+    # Create minimize button with Unicode symbol
+    $minimizeButton = New-Object System.Windows.Forms.Label
+    $minimizeButton.Text = [char]0x2212
+    $minimizeButton.Size = New-Object System.Drawing.Size(30, 30)
+    $minimizeButton.Location = New-Object System.Drawing.Point(340, 0)
+    $minimizeButton.Font = New-Object System.Drawing.Font("Segoe UI", 12)
+    $minimizeButton.ForeColor = $white
+    $minimizeButton.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $minimizeButton.Add_Click({ 
+        $form.WindowState = [System.Windows.Forms.FormWindowState]::Minimized
+    })
+    $minimizeButton.Add_MouseEnter({ 
+        $this.BackColor = $hoverColor
+        $this.Cursor = [System.Windows.Forms.Cursors]::Hand
+    })
+    $minimizeButton.Add_MouseLeave({ 
+        $this.BackColor = $titleBarColor
+    })
+    $titleBar.Controls.Add($minimizeButton)
+
+    $titleLabel = New-Object System.Windows.Forms.Label
+    $titleLabel.Text = "Audio Clipboard Sync"
+    $titleLabel.Font = New-Object System.Drawing.Font("Segoe UI", 16, [System.Drawing.FontStyle]::Bold)
+    $titleLabel.ForeColor = $white
+    $titleLabel.AutoSize = $true
+    $titleLabel.Location = New-Object System.Drawing.Point(20, 50)
+    $form.Controls.Add($titleLabel)
+
+    $ipLabel = New-Object System.Windows.Forms.Label
+    $ipLabel.Text = "Server IP Address"
+    $ipLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+    $ipLabel.ForeColor = $white
+    $ipLabel.AutoSize = $true
+    $ipLabel.Location = New-Object System.Drawing.Point(20, 100)
+    $form.Controls.Add($ipLabel)
+
+    # Create ComboBox
+    $comboBox = New-Object System.Windows.Forms.ComboBox
+    $comboBox.Location = New-Object System.Drawing.Point(20, 130)
+    $comboBox.Size = New-Object System.Drawing.Size(350, 30)
+    $comboBox.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+    $comboBox.BackColor = $white
+    $comboBox.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $form.Controls.Add($comboBox)
+
+    # Create buttons
+    function Create-StyledButton {
+        param($text, $x, $y, $width = 100)
+        
+        $button = New-Object System.Windows.Forms.Button
+        $button.Text = $text
+        $button.Location = New-Object System.Drawing.Point($x, $y)
+        $button.Size = New-Object System.Drawing.Size($width, 35)
+        $button.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+        $button.BackColor = $buttonColor
+        $button.ForeColor = $white
+        $button.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+        $button.FlatAppearance.BorderSize = 0
+        
+        $button.Add_MouseEnter({
+            $this.BackColor = $hoverColor
+            $this.Cursor = [System.Windows.Forms.Cursors]::Hand
+        })
+        $button.Add_MouseLeave({
+            $this.BackColor = $buttonColor
+        })
+        
+        return $button
     }
 
-    $showMenuItem.Add_Click({ $form.Show(); $form.WindowState = "Normal" })
-    $startMenuItem.Add_Click({ $startButton.PerformClick() })
-    $stopMenuItem.Add_Click({ $stopButton.PerformClick() })
-    $stopMenuItem.Enabled = $false
-    $exitMenuItem.Add_Click({
-        $notifyIcon.Visible = $false
-        $form.Close()
+    # Status label
+    $statusLabel = New-Object System.Windows.Forms.Label
+    $statusLabel.Text = "Status: Not Connected"
+    $statusLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+    $statusLabel.ForeColor = [System.Drawing.Color]::Gray
+    $statusLabel.AutoSize = $true
+    $statusLabel.Location = New-Object System.Drawing.Point(20, 160)
+    $form.Controls.Add($statusLabel)
+
+    # Buttons
+    $startButton = Create-StyledButton "Start" 20 190
+    $stopButton = Create-StyledButton "Stop" 140 190
+    $scanButton = Create-StyledButton "Scan" 260 190
+    
+    $form.Controls.Add($startButton)
+    $form.Controls.Add($stopButton)
+    $form.Controls.Add($scanButton)
+
+    $comboBox.Add_SelectedIndexChanged({
+        if ($comboBox.SelectedItem -and $comboBox.SelectedItem.ToString().Contains(": ")) {
+            $selectedIP = ($comboBox.SelectedItem -split ': ')[1].Trim()
+            $comboBox.Text = $selectedIP
+        }
     })
 
-    # Add the scan button click handler
     $scanButton.Add_Click({
         $comboBox.Items.Clear()
         try {
-            # Check if Hyper-V module is available
             if (-not (Get-Module -ListAvailable -Name Hyper-V)) {
                 throw "Hyper-V module not found. Please ensure Hyper-V is installed."
             }
 
-            # Import Hyper-V module
             Import-Module Hyper-V -ErrorAction Stop
-
-            # Get running VMs and their IP addresses
             $vms = Get-VM | Where-Object { $_.State -eq 'Running' }
             
             if ($vms.Count -eq 0) {
@@ -335,37 +386,6 @@ function Show-MainForm {
         }
     })
 
-    # Add ComboBox selection changed handler
-    $comboBox.Add_SelectedIndexChanged({
-        if ($comboBox.SelectedItem -and $comboBox.SelectedItem.ToString().Contains(": ")) {
-            $selectedIP = ($comboBox.SelectedItem -split ': ')[1].Trim()
-            $comboBox.Text = $selectedIP
-        }
-    })
-  
-    $contextMenu.Items.AddRange(@(
-        $showMenuItem,
-        (New-Object System.Windows.Forms.ToolStripSeparator),
-        $startMenuItem,
-        $stopMenuItem,
-        (New-Object System.Windows.Forms.ToolStripSeparator),
-        $exitMenuItem
-    ))
-    $notifyIcon.ContextMenuStrip = $contextMenu
-
-    # Double-click on tray icon shows the form
-    $notifyIcon.Add_MouseDoubleClick({
-        $form.Show()
-        $form.WindowState = "Normal"
-    })
-
-    # Minimize to tray
-    $form.Add_Resize({
-        if ($form.WindowState -eq "Minimized") {
-            $form.Hide()
-        }
-    })
-
     # Start button click handler
     $startButton.Add_Click({
         $script:ServerIP = $comboBox.Text.Trim()
@@ -403,7 +423,6 @@ function Show-MainForm {
         $script:runspace.ThreadOptions = "ReuseThread"
         $script:runspace.Open()
 
-        # Add necessary functions and variables to runspace
         $script:runspace.SessionStateProxy.SetVariable('ServerIP', $ServerIP)
         $script:runspace.SessionStateProxy.SetVariable('clipboardPort', $clipboardPort)
         $script:runspace.SessionStateProxy.SetVariable('syncDir', $syncDir)
@@ -472,7 +491,6 @@ function Show-MainForm {
                             $client = New-Object System.Net.Sockets.TcpClient
                             $client.Connect($ServerIP, $ClipboardPort)
                             $stream = $client.GetStream()
-                            Write-DebugLog "Connected successfully" "INFO"
                             Write-DebugLog "Connected successfully" "INFO"
                         }
                         
@@ -575,17 +593,17 @@ function Show-MainForm {
             Stop-Job -Job $script:audioJob
             Remove-Job -Job $script:audioJob
         }
-        
+
         if ($script:powershell) {
             $script:powershell.Stop()
             $script:powershell.Dispose()
         }
-        
+
         if ($script:runspace) {
             $script:runspace.Close()
             $script:runspace.Dispose()
         }
-        
+
         Kill-AllVLC
         $statusLabel.Text = "Status: Not Connected"
         $statusLabel.ForeColor = [System.Drawing.Color]::Gray
@@ -594,8 +612,7 @@ function Show-MainForm {
         $startMenuItem.Enabled = $true
         $stopMenuItem.Enabled = $false
     })
-
-    # Handle form closing
+    
     $form.Add_Closing({
         $stopButton.PerformClick()
         $notifyIcon.Visible = $false
@@ -610,13 +627,11 @@ function Check-VLCInstalled {
     return Test-Path $vlcPath
 }
 
-# Main execution block - This ensures the script runs properly when double-clicked
 if ($MyInvocation.MyCommand.CommandType -eq "ExternalScript") {
     # Check if VLC is installed
     if (-not (Check-VLCInstalled)) {
         Install-VLC
     }
 
-    # Show the main form
     Show-MainForm
 }
