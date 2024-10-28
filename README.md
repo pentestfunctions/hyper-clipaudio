@@ -7,7 +7,7 @@
 > Restore clipboard synchronization and audio streaming functionality to Hyper-V basic sessions without compromising performance.
 
 <p align="center">
-  <img src="https://github.com/pentestfunctions/hyper-clipaudio/blob/main/images/demo.gif?raw=true">
+  <img src="https://github.com/pentestfunctions/hyper-clipaudio/blob/main/images/working.gif?raw=true">
 </p>
 
 
