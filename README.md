@@ -37,14 +37,13 @@ cd hyper-clipaudio
 ```bash
 # For Debian/Ubuntu-based systems (including Kali):
 sudo apt update
-sudo apt install -y python3-pip xsel vlc pulseaudio python3-pyaudio
+sudo apt install -y python3-pip xsel
 pip3 install -r requirements.txt
 
 # You can run ip a to find your IPv4 address or check your Hyper-V machine settings in the Hyper-V Manager for the IP
 
 # For Arch Linux:
-sudo pacman -S python-pip xsel vlc pulseaudio python-pyaudio
-pip3 install -r requirements.txt
+sudo pacman -S python-pip xsel pyaudio
 ```
 
 3. Start the server:
