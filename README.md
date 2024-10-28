@@ -38,7 +38,7 @@ cd hyper-clipaudio
 # For Debian/Ubuntu-based systems (including Kali):
 sudo apt update
 sudo apt install -y python3-pip xsel
-pip3 install -r requirements.txt
+pip install pyaudio
 
 # You can run ip a to find your IPv4 address or check your Hyper-V machine settings in the Hyper-V Manager for the IP
 
@@ -55,7 +55,7 @@ python3 linux_listener.py
 
 1. Download the `windows_connector.ps1` script
 2. Ensure VLC is installed (script will auto-install using winget if missing)
-3. Run the PowerShell script:
+3. Run the PowerShell script either by double clicking it or running in your terminal:
 ```powershell
 powershell -ExecutionPolicy Bypass -File windows_connector.ps1
 ```
@@ -65,7 +65,6 @@ powershell -ExecutionPolicy Bypass -File windows_connector.ps1
 ### Linux (Host VM)
 ```txt
 pyaudio==0.2.13
-python-vlc==3.0.18122
 ```
 
 ### Windows (Host)
