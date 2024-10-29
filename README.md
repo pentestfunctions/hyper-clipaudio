@@ -59,6 +59,14 @@ sudo pacman -S python-pip xsel pyaudio
 python3 linux_listener.py
 ```
 
+
+# ADVISED!
+This will setup 'audioclip' for you to execute directly from your terminal to start the service. Then you just need the powershell script. THAT EASY!
+```
+sudo wget https://raw.githubusercontent.com/pentestfunctions/hyper-clipaudio/refs/heads/main/audioclip -O /bin/audioclip
+sudo chmod +x /bin/audioclip
+```
+
 ### Windows (Host) Setup
 
 1. Download the `windows_connector.ps1` script
