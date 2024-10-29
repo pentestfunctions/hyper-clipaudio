@@ -86,6 +86,25 @@ chown -R $ACTUAL_USER:$ACTUAL_USER /run/user/${USER_ID}
 chmod 755 /var/log/hyper-clipaudio
 chmod 700 /run/user/${USER_ID}
 
+# Create ALSA configuration
+print_status "Setting up ALSA configuration..."
+cat > /etc/asound.conf << EOL
+defaults.pcm.card 0
+defaults.ctl.card 0
+pcm.pulse {
+    type pulse
+}
+ctl.pulse {
+    type pulse
+}
+pcm.!default {
+    type pulse
+}
+ctl.!default {
+    type pulse
+}
+EOL
+
 # Create PulseAudio configuration
 print_status "Setting up PulseAudio configuration..."
 sudo -u $ACTUAL_USER mkdir -p ${USER_HOME}/.config/pulse
@@ -94,6 +113,16 @@ autospawn = yes
 daemon-binary = /usr/bin/pulseaudio
 EOL
 chown -R $ACTUAL_USER:$ACTUAL_USER ${USER_HOME}/.config/pulse
+
+cat > ${USER_HOME}/.config/pulse/daemon.conf << EOL
+daemonize = yes
+allow-module-loading = yes
+allow-exit = yes
+resample-method = speex-float-1
+enable-remixing = yes
+enable-lfe-remixing = no
+flat-volumes = no
+EOL
 
 # Download the server script
 print_status "Downloading server script..."
@@ -130,29 +159,42 @@ check_pulseaudio() {
 # Initialize PulseAudio
 log "Initializing PulseAudio..."
 
-# Try to start PulseAudio
-pulseaudio --start --log-target=syslog 2>&1 | while read -r line; do
+# Kill any existing PulseAudio processes
+pulseaudio -k || true
+sleep 1
+
+# Start PulseAudio with specific configuration
+pulseaudio --start --log-target=syslog --exit-idle-time=-1 --daemon 2>&1 | while read -r line; do
     log "PulseAudio: $line"
-    # If we see "already running" message, that's fine
-    if [[ "$line" == *"daemon already running"* ]]; then
-        log "PulseAudio is already running"
-    fi
 done
 
 # Wait for PulseAudio to initialize
 sleep 2
 
 # Verify PulseAudio is working
+retry_count=0
+max_retries=5
+while ! check_pulseaudio && [ $retry_count -lt $max_retries ]; do
+    log "Waiting for PulseAudio to start (attempt $((retry_count + 1))/$max_retries)..."
+    sleep 2
+    retry_count=$((retry_count + 1))
+done
+
 if check_pulseaudio; then
     log "PulseAudio is operational"
 else
-    log "Failed to initialize PulseAudio"
+    log "Failed to initialize PulseAudio after $max_retries attempts"
     exit 1
 fi
+
+# Load required PulseAudio modules
+pactl load-module module-null-sink sink_name=virtual_speaker sink_properties=device.description=Virtual_Speaker || log "Warning: Failed to load null-sink module"
+pactl load-module module-virtual-source source_name=virtual_mic || log "Warning: Failed to load virtual-source module"
 
 # List audio devices
 log "Available audio devices:"
 pactl list short sources || log "No audio sources found"
+pactl list short sinks || log "No audio sinks found"
 
 # Start the server
 log "Starting Python server..."
@@ -189,9 +231,10 @@ Environment=PYTHONUNBUFFERED=1
 
 WorkingDirectory=/opt/hyper-clipaudio
 
+# Set up runtime directory
 ExecStartPre=/bin/sh -c 'mkdir -p /run/user/${USER_ID}/pulse'
-ExecStartPre=/bin/sh -c 'chown -R ${ACTUAL_USER}:${ACTUAL_USER} /run/user/${USER_ID}'
-ExecStartPre=/bin/sh -c 'chmod -R 700 /run/user/${USER_ID}'
+ExecStartPre=/bin/sh -c 'chown ${ACTUAL_USER}:${ACTUAL_USER} /run/user/${USER_ID}/pulse'
+ExecStartPre=/bin/sh -c 'chmod 700 /run/user/${USER_ID}/pulse'
 
 ExecStart=/opt/hyper-clipaudio/run_server.sh
 
@@ -218,6 +261,16 @@ chmod -R 755 /opt/hyper-clipaudio
 print_status "Adding user to required groups..."
 usermod -a -G audio,pulse,pulse-access $ACTUAL_USER
 
+# Create PulseAudio socket directory with correct permissions
+mkdir -p /run/user/${USER_ID}/pulse
+chown -R $ACTUAL_USER:$ACTUAL_USER /run/user/${USER_ID}
+chmod -R 700 /run/user/${USER_ID}
+
+# Ensure ALSA modules are loaded
+print_status "Loading ALSA modules..."
+modprobe snd-seq || print_warning "Failed to load snd-seq module"
+modprobe snd-pcm || print_warning "Failed to load snd-pcm module"
+
 # Reload systemd and start service
 print_status "Starting service..."
 systemctl daemon-reload
@@ -228,17 +281,22 @@ systemctl start hyper-clipaudio
 sleep 3
 
 # Verify service
-if [ ! -f "/etc/systemd/system/hyper-clipaudio.service" ]; then
-    handle_error "Service file was not created properly"
-fi
-
-# Final status check
 if systemctl is-active --quiet hyper-clipaudio; then
     print_status "Service successfully started!"
     systemctl status hyper-clipaudio
 else
     print_warning "Service failed to start. Checking logs..."
     journalctl -u hyper-clipaudio -n 50 --no-pager
+    
+    print_warning "Attempting to diagnose issues..."
+    print_status "PulseAudio status:"
+    sudo -u $ACTUAL_USER pulseaudio --check || echo "PulseAudio not running"
+    
+    print_status "ALSA devices:"
+    aplay -l || echo "No ALSA devices found"
+    
+    print_status "PulseAudio devices:"
+    sudo -u $ACTUAL_USER pactl list || echo "No PulseAudio devices found"
 fi
 
 print_status "Installation complete!"
@@ -259,3 +317,5 @@ echo "3. Check debug log: cat /var/log/hyper-clipaudio/debug.log"
 echo "4. Test audio: pactl list sources"
 echo "5. Try running manually: sudo -u $ACTUAL_USER /opt/hyper-clipaudio/run_server.sh"
 echo "6. If needed, restart PulseAudio: pulseaudio -k && pulseaudio --start"
+echo "7. Check ALSA configuration: cat /proc/asound/cards"
+echo "8. Verify runtime directory: ls -la /run/user/${USER_ID}/pulse"
