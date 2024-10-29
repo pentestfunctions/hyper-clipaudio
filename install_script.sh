@@ -36,48 +36,24 @@ if [ -z "$ACTUAL_USER" ]; then
     exit 1
 fi
 
-# Get user ID for runtime directory
 USER_ID=$(id -u $ACTUAL_USER)
+USER_HOME=$(eval echo ~$ACTUAL_USER)
 
 print_status "Installing for user: $ACTUAL_USER (UID: $USER_ID)"
 
 # Install required packages
 print_status "Installing required packages..."
-pacman -Sq --noconfirm python python-pyaudio python-pip xsel pulseaudio pulseaudio-alsa alsa-utils || {
+pacman -Sq --noconfirm python python-pip xsel pulseaudio pulseaudio-alsa alsa-utils portaudio || {
     print_error "Failed to install required packages"
     exit 1
 }
 
-# Setup audio configuration
-print_status "Setting up audio configuration..."
-
-# Create pulse config directory
-sudo -u $ACTUAL_USER mkdir -p /home/$ACTUAL_USER/.config/pulse
-
-# Configure PulseAudio for the user
-cat > /home/$ACTUAL_USER/.config/pulse/client.conf << EOL
-# Connect to the system-wide PulseAudio server
-default-server = unix:/run/user/${USER_ID}/pulse/native
-autospawn = yes
-daemon-binary = /usr/bin/pulseaudio
-EOL
-
-# Set proper ownership
-chown -R $ACTUAL_USER:$ACTUAL_USER /home/$ACTUAL_USER/.config/pulse
-
-# Create ALSA configuration if it doesn't exist
-if [ ! -f "/home/$ACTUAL_USER/.asoundrc" ]; then
-    cat > /home/$ACTUAL_USER/.asoundrc << EOL
-pcm.!default {
-    type pulse
+# Install PyAudio using pip
+print_status "Installing PyAudio using pip..."
+sudo -u $ACTUAL_USER pip install --user pyaudio || {
+    print_error "Failed to install PyAudio"
+    exit 1
 }
-
-ctl.!default {
-    type pulse
-}
-EOL
-    chown $ACTUAL_USER:$ACTUAL_USER /home/$ACTUAL_USER/.asoundrc
-fi
 
 # Create required directories
 print_status "Creating required directories..."
@@ -87,7 +63,7 @@ mkdir -p /run/user/${USER_ID}/pulse
 chown -R $ACTUAL_USER:$ACTUAL_USER /var/log/hyper-clipaudio
 chown -R $ACTUAL_USER:$ACTUAL_USER /run/user/${USER_ID}
 
-# Download the latest version of the script
+# Download the script
 print_status "Downloading latest version of the server script..."
 curl -s https://raw.githubusercontent.com/pentestfunctions/hyper-clipaudio/main/linux_listener.py > /opt/hyper-clipaudio/server.py || {
     print_error "Failed to download server script"
@@ -98,12 +74,36 @@ curl -s https://raw.githubusercontent.com/pentestfunctions/hyper-clipaudio/main/
 chmod +x /opt/hyper-clipaudio/server.py
 chown -R $ACTUAL_USER:$ACTUAL_USER /opt/hyper-clipaudio
 
+# Create wrapper script to set up environment
+print_status "Creating wrapper script..."
+cat > /opt/hyper-clipaudio/run_server.sh << EOL
+#!/bin/bash
+export HOME="${USER_HOME}"
+export XDG_RUNTIME_DIR="/run/user/${USER_ID}"
+export PULSE_RUNTIME_PATH="/run/user/${USER_ID}/pulse"
+export PULSE_SERVER="unix:/run/user/${USER_ID}/pulse/native"
+export PATH="\$PATH:${USER_HOME}/.local/bin"
+export PYTHONPATH="${USER_HOME}/.local/lib/python3.12/site-packages:\$PYTHONPATH"
+
+# Start pulseaudio if not running
+pulseaudio --check || pulseaudio --start --log-target=syslog
+
+# Wait for PulseAudio to be ready
+sleep 2
+
+# Run the server
+exec python /opt/hyper-clipaudio/server.py
+EOL
+
+chmod +x /opt/hyper-clipaudio/run_server.sh
+chown $ACTUAL_USER:$ACTUAL_USER /opt/hyper-clipaudio/run_server.sh
+
 # Create systemd service file
 print_status "Creating systemd service..."
 cat > /etc/systemd/system/hyper-clipaudio.service << EOL
 [Unit]
 Description=Unified Clipboard and Audio Server
-After=network.target sound.target pulseaudio.service
+After=network.target sound.target
 Wants=network.target sound.target
 
 [Service]
@@ -111,17 +111,16 @@ Type=simple
 User=$ACTUAL_USER
 Group=audio
 Environment=DISPLAY=:0
-Environment=XAUTHORITY=/home/$ACTUAL_USER/.Xauthority
-Environment=XDG_RUNTIME_DIR=/run/user/${USER_ID}
-Environment=PULSE_RUNTIME_PATH=/run/user/${USER_ID}/pulse
-Environment=PULSE_SERVER=unix:/run/user/${USER_ID}/pulse/native
+Environment=XAUTHORITY=${USER_HOME}/.Xauthority
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${USER_ID}/bus
 WorkingDirectory=/opt/hyper-clipaudio
-ExecStartPre=/usr/bin/pulseaudio --start --log-target=syslog
-ExecStart=/usr/bin/python /opt/hyper-clipaudio/server.py
+ExecStart=/opt/hyper-clipaudio/run_server.sh
 Restart=always
 RestartSec=30
 StartLimitInterval=300
 StartLimitBurst=5
+StandardOutput=append:/var/log/hyper-clipaudio/stdout.log
+StandardError=append:/var/log/hyper-clipaudio/stderr.log
 
 [Install]
 WantedBy=multi-user.target
@@ -130,16 +129,10 @@ EOL
 # Add user to required groups
 usermod -a -G audio,pulse,pulse-access $ACTUAL_USER
 
-# Start pulseaudio for the user
-print_status "Starting PulseAudio..."
-sudo -u $ACTUAL_USER pulseaudio --start
-
-# Wait for PulseAudio to start
-sleep 2
-
-# Test audio setup
-print_status "Testing audio setup..."
-sudo -u $ACTUAL_USER pactl list short sources || print_warning "No audio sources found"
+# Ensure proper permissions for XDG_RUNTIME_DIR
+mkdir -p /run/user/${USER_ID}
+chmod 700 /run/user/${USER_ID}
+chown $ACTUAL_USER:$ACTUAL_USER /run/user/${USER_ID}
 
 # Reload systemd daemon
 print_status "Reloading systemd daemon..."
@@ -167,6 +160,10 @@ print_status "Installation complete!"
 print_status "Current port configuration:"
 echo "Audio Port: 5001"
 echo "Clipboard Port: 12345"
-echo ""
+
 print_warning "Make sure these ports are allowed through your firewall!"
-print_warning "If you experience issues, try rebooting the system to ensure all audio services are properly initialized."
+print_warning "If you experience issues, try the following:"
+echo "1. Check service status: systemctl status hyper-clipaudio"
+echo "2. Check logs: journalctl -u hyper-clipaudio"
+echo "3. Check audio devices: pactl list sources"
+echo "4. Manually run: /opt/hyper-clipaudio/run_server.sh"
