@@ -58,10 +58,13 @@ print_status "Installing for user: $ACTUAL_USER (UID: $USER_ID)"
 print_status "Cleaning up existing installation..."
 systemctl stop hyper-clipaudio 2>/dev/null || true
 systemctl disable hyper-clipaudio 2>/dev/null || true
-pkill -u $ACTUAL_USER pulseaudio 2>/dev/null || true
 rm -f /etc/systemd/system/hyper-clipaudio.service
 systemctl daemon-reload
 systemctl reset-failed
+
+# Stop any existing PulseAudio instances
+sudo -u $ACTUAL_USER pkill pulseaudio || true
+sleep 2
 
 # Install required packages
 print_status "Installing required packages..."
@@ -109,20 +112,47 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a /var/log/hyper-clipaudio/debug.log
 }
 
-# Wait for PulseAudio to be ready
-log "Waiting for PulseAudio..."
-for i in {1..10}; do
-    if pulseaudio --check; then
-        log "PulseAudio is running"
-        break
+# Ensure log directory exists
+mkdir -p /var/log/hyper-clipaudio
+
+log "Starting server wrapper"
+
+# Function to check PulseAudio status
+check_pulseaudio() {
+    # Try to get PulseAudio info
+    if pactl info >/dev/null 2>&1; then
+        return 0  # PulseAudio is running
+    else
+        return 1  # PulseAudio is not running
     fi
-    sleep 1
+}
+
+# Initialize PulseAudio
+log "Initializing PulseAudio..."
+
+# Try to start PulseAudio
+pulseaudio --start --log-target=syslog 2>&1 | while read -r line; do
+    log "PulseAudio: $line"
+    # If we see "already running" message, that's fine
+    if [[ "$line" == *"daemon already running"* ]]; then
+        log "PulseAudio is already running"
+    fi
 done
 
-if ! pulseaudio --check; then
-    log "PulseAudio failed to start"
+# Wait for PulseAudio to initialize
+sleep 2
+
+# Verify PulseAudio is working
+if check_pulseaudio; then
+    log "PulseAudio is operational"
+else
+    log "Failed to initialize PulseAudio"
     exit 1
 fi
+
+# List audio devices
+log "Available audio devices:"
+pactl list short sources || log "No audio sources found"
 
 # Start the server
 log "Starting Python server..."
@@ -144,6 +174,9 @@ Wants=network.target sound.target
 Type=simple
 User=${ACTUAL_USER}
 Group=audio
+RuntimeDirectory=hyper-clipaudio
+RuntimeDirectoryMode=0755
+
 Environment=DISPLAY=:0
 Environment=XAUTHORITY=${USER_HOME}/.Xauthority
 Environment=XDG_RUNTIME_DIR=/run/user/${USER_ID}
@@ -153,24 +186,16 @@ Environment=PULSE_RUNTIME_PATH=/run/user/${USER_ID}/pulse
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:${USER_HOME}/.local/bin
 Environment=PYTHONPATH=${USER_HOME}/.local/lib/python3.12/site-packages
 Environment=PYTHONUNBUFFERED=1
+
 WorkingDirectory=/opt/hyper-clipaudio
 
-# Kill any existing PulseAudio
-ExecStartPre=/usr/bin/killall -u ${ACTUAL_USER} pulseaudio || true
-ExecStartPre=/bin/sleep 1
-
-# Ensure directory structure
-ExecStartPre=/bin/mkdir -p /run/user/${USER_ID}/pulse
-ExecStartPre=/bin/chown -R ${ACTUAL_USER}:${ACTUAL_USER} /run/user/${USER_ID}
-ExecStartPre=/bin/chmod -R 700 /run/user/${USER_ID}
-
-# Start PulseAudio
-ExecStartPre=/usr/bin/pulseaudio --start --log-target=syslog --exit-idle-time=-1 --disallow-exit
-ExecStartPre=/bin/sleep 2
+ExecStartPre=/bin/sh -c 'mkdir -p /run/user/${USER_ID}/pulse'
+ExecStartPre=/bin/sh -c 'chown -R ${ACTUAL_USER}:${ACTUAL_USER} /run/user/${USER_ID}'
+ExecStartPre=/bin/sh -c 'chmod -R 700 /run/user/${USER_ID}'
 
 ExecStart=/opt/hyper-clipaudio/run_server.sh
 
-Restart=always
+Restart=on-failure
 RestartSec=30
 StartLimitInterval=300
 StartLimitBurst=5
@@ -233,3 +258,4 @@ echo "2. View logs: journalctl -u hyper-clipaudio -f"
 echo "3. Check debug log: cat /var/log/hyper-clipaudio/debug.log"
 echo "4. Test audio: pactl list sources"
 echo "5. Try running manually: sudo -u $ACTUAL_USER /opt/hyper-clipaudio/run_server.sh"
+echo "6. If needed, restart PulseAudio: pulseaudio -k && pulseaudio --start"
