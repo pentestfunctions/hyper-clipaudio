@@ -41,7 +41,7 @@ cleanup_previous_install() {
         systemctl disable hyper-clipaudio
     fi
     
-    # Remove service file
+    # Remove service files
     if [ -f "/etc/systemd/system/hyper-clipaudio.service" ]; then
         print_status "Removing existing service file..."
         rm -f /etc/systemd/system/hyper-clipaudio.service
@@ -114,70 +114,10 @@ mkdir -p /var/log/hyper-clipaudio
 mkdir -p /run/user/${USER_ID}/pulse
 chown -R $ACTUAL_USER:$ACTUAL_USER /var/log/hyper-clipaudio
 chown -R $ACTUAL_USER:$ACTUAL_USER /run/user/${USER_ID}
+chmod 755 /var/log/hyper-clipaudio
 chmod 700 /run/user/${USER_ID}
 
-# Setup audio configuration
-print_status "Setting up audio configuration..."
-
-# Create pulse config directory
-sudo -u $ACTUAL_USER mkdir -p ${USER_HOME}/.config/pulse
-
-# Configure PulseAudio for the user
-cat > ${USER_HOME}/.config/pulse/client.conf << EOL
-default-server = unix:/run/user/${USER_ID}/pulse/native
-autospawn = yes
-daemon-binary = /usr/bin/pulseaudio
-EOL
-
-chown -R $ACTUAL_USER:$ACTUAL_USER ${USER_HOME}/.config/pulse
-
-# Create ALSA configuration
-cat > ${USER_HOME}/.asoundrc << EOL
-pcm.!default {
-    type pulse
-}
-
-ctl.!default {
-    type pulse
-}
-EOL
-chown $ACTUAL_USER:$ACTUAL_USER ${USER_HOME}/.asoundrc
-
-# Download the script
-print_status "Downloading latest version of the server script..."
-curl -s https://raw.githubusercontent.com/pentestfunctions/hyper-clipaudio/main/linux_listener.py > /opt/hyper-clipaudio/server.py || \
-    handle_error "Failed to download server script"
-
-# Make script executable
-chmod +x /opt/hyper-clipaudio/server.py
-chown -R $ACTUAL_USER:$ACTUAL_USER /opt/hyper-clipaudio
-
-# Create wrapper script
-print_status "Creating wrapper script..."
-cat > /opt/hyper-clipaudio/run_server.sh << EOL
-#!/bin/bash
-export HOME="${USER_HOME}"
-export XDG_RUNTIME_DIR="/run/user/${USER_ID}"
-export PULSE_RUNTIME_PATH="/run/user/${USER_ID}/pulse"
-export PULSE_SERVER="unix:/run/user/${USER_ID}/pulse/native"
-export PATH="\$PATH:${USER_HOME}/.local/bin"
-export PYTHONPATH="${USER_HOME}/.local/lib/python3.12/site-packages:\$PYTHONPATH"
-export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${USER_ID}/bus"
-
-# Start pulseaudio if not running
-pulseaudio --check || pulseaudio --start --log-target=syslog
-
-# Wait for PulseAudio to be ready
-sleep 2
-
-# Run the server
-exec python /opt/hyper-clipaudio/server.py
-EOL
-
-chmod +x /opt/hyper-clipaudio/run_server.sh
-chown $ACTUAL_USER:$ACTUAL_USER /opt/hyper-clipaudio/run_server.sh
-
-# Create systemd service file
+# Create service file
 print_status "Creating systemd service..."
 cat > /etc/systemd/system/hyper-clipaudio.service << EOL
 [Unit]
@@ -187,48 +127,147 @@ Wants=network.target sound.target
 
 [Service]
 Type=simple
-User=$ACTUAL_USER
+User=${ACTUAL_USER}
 Group=audio
+RuntimeDirectory=hyper-clipaudio
+RuntimeDirectoryMode=0755
 Environment=DISPLAY=:0
 Environment=XAUTHORITY=${USER_HOME}/.Xauthority
-Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${USER_ID}/bus
+Environment=XDG_RUNTIME_DIR=/run/user/${USER_ID}
+Environment=HOME=${USER_HOME}
+Environment=PULSE_SERVER=unix:/run/user/${USER_ID}/pulse/native
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:${USER_HOME}/.local/bin
+Environment=PYTHONUNBUFFERED=1
 WorkingDirectory=/opt/hyper-clipaudio
-ExecStartPre=/usr/bin/pulseaudio --start --log-target=syslog
-ExecStart=/opt/hyper-clipaudio/run_server.sh
+
+# Start PulseAudio if not running
+ExecStartPre=/bin/sh -c 'mkdir -p /run/user/${USER_ID}/pulse'
+ExecStartPre=/bin/sh -c 'chown -R ${ACTUAL_USER}:${ACTUAL_USER} /run/user/${USER_ID}'
+ExecStartPre=/bin/sh -c 'chmod -R 700 /run/user/${USER_ID}'
+ExecStartPre=/bin/sh -c '/usr/bin/pulseaudio --check || { /usr/bin/pulseaudio --start --log-target=syslog --exit-idle-time=-1 & sleep 2; }'
+
+ExecStart=/usr/bin/bash -c '/opt/hyper-clipaudio/run_server.sh 2>&1 | tee -a /var/log/hyper-clipaudio/debug.log'
 Restart=always
 RestartSec=30
 StartLimitInterval=300
 StartLimitBurst=5
-StandardOutput=append:/var/log/hyper-clipaudio/stdout.log
-StandardError=append:/var/log/hyper-clipaudio/stderr.log
 
 [Install]
 WantedBy=multi-user.target
 EOL
 
+# Create wrapper script
+print_status "Creating wrapper script..."
+cat > /opt/hyper-clipaudio/run_server.sh << EOL
+#!/bin/bash
+
+# Enable error reporting
+set -e
+set -o pipefail
+
+# Log function
+log() {
+    echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$1" | tee -a /var/log/hyper-clipaudio/debug.log
+}
+
+# Error handler
+handle_error() {
+    log "Error on line \$1"
+    exit 1
+}
+
+trap 'handle_error \$LINENO' ERR
+
+# Ensure directories exist
+log "Setting up directories..."
+mkdir -p /run/user/${USER_ID}/pulse
+chmod 700 /run/user/${USER_ID}
+chown -R ${ACTUAL_USER}:${ACTUAL_USER} /run/user/${USER_ID}
+
+# Set up environment
+export HOME="${USER_HOME}"
+export XDG_RUNTIME_DIR="/run/user/${USER_ID}"
+export PULSE_RUNTIME_PATH="/run/user/${USER_ID}/pulse"
+export PULSE_SERVER="unix:/run/user/${USER_ID}/pulse/native"
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:${USER_HOME}/.local/bin:\$PATH"
+export PYTHONPATH="${USER_HOME}/.local/lib/python3.12/site-packages:\$PYTHONPATH"
+export PYTHONUNBUFFERED=1
+
+# Log environment
+log "Environment setup:"
+log "HOME: \$HOME"
+log "XDG_RUNTIME_DIR: \$XDG_RUNTIME_DIR"
+log "PULSE_SERVER: \$PULSE_SERVER"
+log "PATH: \$PATH"
+log "PYTHONPATH: \$PYTHONPATH"
+
+# Check PulseAudio
+log "Checking PulseAudio status..."
+if ! pulseaudio --check; then
+    log "Starting PulseAudio..."
+    pulseaudio --start --log-target=syslog --exit-idle-time=-1
+    sleep 2
+fi
+
+# Verify PulseAudio is running
+if pulseaudio --check; then
+    log "PulseAudio is running"
+else
+    log "Failed to start PulseAudio"
+    exit 1
+fi
+
+# Check audio devices
+log "Checking audio devices..."
+pactl list short sources || log "No audio sources found"
+
+# Start the server with error logging
+log "Starting Python server..."
+exec python /opt/hyper-clipaudio/server.py 2>&1
+EOL
+
+# Set permissions
+chmod +x /opt/hyper-clipaudio/run_server.sh
+chown $ACTUAL_USER:$ACTUAL_USER /opt/hyper-clipaudio/run_server.sh
+
+# Set up PulseAudio configuration
+print_status "Setting up PulseAudio configuration..."
+sudo -u $ACTUAL_USER mkdir -p ${USER_HOME}/.config/pulse
+cat > ${USER_HOME}/.config/pulse/client.conf << EOL
+autospawn = yes
+daemon-binary = /usr/bin/pulseaudio
+EOL
+chown -R $ACTUAL_USER:$ACTUAL_USER ${USER_HOME}/.config/pulse
+
 # Add user to required groups
+print_status "Adding user to required groups..."
 usermod -a -G audio,pulse,pulse-access $ACTUAL_USER
 
-# Reload systemd daemon
+# Download the script
+print_status "Downloading latest version of the server script..."
+curl -s https://raw.githubusercontent.com/pentestfunctions/hyper-clipaudio/main/linux_listener.py > /opt/hyper-clipaudio/server.py || \
+    handle_error "Failed to download server script"
+
+chmod +x /opt/hyper-clipaudio/server.py
+chown -R $ACTUAL_USER:$ACTUAL_USER /opt/hyper-clipaudio
+
+# Reload systemd
 print_status "Reloading systemd daemon..."
 systemctl daemon-reload
 
-# Start pulseaudio for the user
-print_status "Starting PulseAudio..."
-sudo -u $ACTUAL_USER pulseaudio --start || true
-sleep 2
-
-# Enable and start the service
-print_status "Enabling and starting service..."
+# Start service
+print_status "Starting service..."
 systemctl enable hyper-clipaudio
 systemctl start hyper-clipaudio
 
-# Wait a moment for the service to start
+# Wait for service to start
 sleep 3
 
 # Check service status
 if systemctl is-active --quiet hyper-clipaudio; then
     print_status "Service successfully started!"
+    print_status "You can check the status using: systemctl status hyper-clipaudio"
+    print_status "View logs using: journalctl -u hyper-clipaudio"
 else
     print_warning "Service failed to start. Checking logs..."
     journalctl -u hyper-clipaudio -n 50 --no-pager
@@ -245,9 +284,10 @@ echo "Audio Port: 5001"
 echo "Clipboard Port: 12345"
 echo ""
 print_warning "Make sure these ports are allowed through your firewall!"
-print_warning "If you experience issues, try the following:"
+print_warning "If you experience issues, try:"
 echo "1. Check service status: systemctl status hyper-clipaudio"
 echo "2. Check logs: journalctl -u hyper-clipaudio"
-echo "3. Check audio devices: pactl list sources"
-echo "4. Manually run: /opt/hyper-clipaudio/run_server.sh"
-echo "5. Reboot the system if audio is not working properly"
+echo "3. Check detailed logs: cat /var/log/hyper-clipaudio/debug.log"
+echo "4. Check audio devices: pactl list sources"
+echo "5. Manually run: /opt/hyper-clipaudio/run_server.sh"
+echo "6. You may need to log out and back in for group changes to take effect"
