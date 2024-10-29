@@ -25,59 +25,12 @@ handle_error() {
     exit 1
 }
 
-# Function to get current groups for user
-get_current_groups() {
-    local user=$1
-    groups $user | cut -d: -f2 | sed 's/^[ \t]*//'
-}
-
-# Function to cleanup previous installations
-cleanup_previous_install() {
-    print_status "Cleaning up previous installation..."
-    
-    # Stop any running service
-    if systemctl is-active --quiet hyper-clipaudio; then
-        print_status "Stopping existing service..."
-        systemctl stop hyper-clipaudio
+# Function to verify file creation
+verify_file() {
+    if [ ! -f "$1" ]; then
+        handle_error "Failed to create file: $1"
     fi
-    
-    # Disable the service
-    if systemctl is-enabled --quiet hyper-clipaudio 2>/dev/null; then
-        print_status "Disabling existing service..."
-        systemctl disable hyper-clipaudio
-    fi
-    
-    # Remove service files
-    if [ -f "/etc/systemd/system/hyper-clipaudio.service" ]; then
-        print_status "Removing existing service file..."
-        rm -f /etc/systemd/system/hyper-clipaudio.service
-    fi
-    
-    # Remove any remaining service files
-    find /etc/systemd/system -name "hyper-clipaudio*.service" -exec rm -f {} \;
-    
-    # Clean up systemd
-    print_status "Cleaning up systemd..."
-    systemctl daemon-reload
-    systemctl reset-failed
-    
-    # Remove old installation files
-    if [ -d "/opt/hyper-clipaudio" ]; then
-        print_status "Removing old installation files..."
-        rm -rf /opt/hyper-clipaudio
-    fi
-    
-    # Clean up log files but keep the directory
-    if [ -d "/var/log/hyper-clipaudio" ]; then
-        print_status "Cleaning up old log files..."
-        rm -f /var/log/hyper-clipaudio/*
-    fi
-    
-    # Kill any remaining processes
-    print_status "Checking for remaining processes..."
-    pkill -f "hyper-clipaudio" || true
-    
-    print_status "Cleanup complete!"
+    print_status "Successfully created: $1"
 }
 
 # Check if script is run as root
@@ -100,11 +53,11 @@ USER_HOME=$(eval echo ~$ACTUAL_USER)
 
 print_status "Installing for user: $ACTUAL_USER (UID: $USER_ID)"
 
-# Store current groups
-CURRENT_GROUPS=$(get_current_groups $ACTUAL_USER)
-
-# Run cleanup
-cleanup_previous_install
+# Create required directories
+print_status "Creating required directories..."
+mkdir -p /opt/hyper-clipaudio
+mkdir -p /var/log/hyper-clipaudio
+mkdir -p /run/user/${USER_ID}/pulse
 
 # Install required packages
 print_status "Installing required packages..."
@@ -116,81 +69,140 @@ print_status "Installing PyAudio using pip..."
 sudo -u $ACTUAL_USER pip install --user pyaudio || \
     handle_error "Failed to install PyAudio"
 
-# Create required directories
-print_status "Creating required directories..."
+# Create the server script
+print_status "Creating server script..."
 mkdir -p /opt/hyper-clipaudio
-mkdir -p /var/log/hyper-clipaudio
-mkdir -p /run/user/${USER_ID}/pulse
+curl -s https://raw.githubusercontent.com/pentestfunctions/hyper-clipaudio/main/linux_listener.py > /opt/hyper-clipaudio/server.py
+verify_file "/opt/hyper-clipaudio/server.py"
+chmod +x /opt/hyper-clipaudio/server.py
+
+# Create the wrapper script
+print_status "Creating wrapper script..."
+cat > /opt/hyper-clipaudio/run_server.sh << 'EOL'
+#!/bin/bash
+
+# Enable error reporting
+set -e
+set -o pipefail
+
+# Log function
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a /var/log/hyper-clipaudio/debug.log
+}
+
+# Error handler
+handle_error() {
+    log "Error on line $1"
+    exit 1
+}
+
+trap 'handle_error $LINENO' ERR
+
+log "Starting server wrapper script"
+log "Current user: $(whoami)"
+log "Current directory: $(pwd)"
+
+# Start the server
+exec python /opt/hyper-clipaudio/server.py 2>&1
+EOL
+
+verify_file "/opt/hyper-clipaudio/run_server.sh"
+chmod +x /opt/hyper-clipaudio/run_server.sh
+
+# Create the systemd service file
+print_status "Creating systemd service file..."
+cat > /etc/systemd/system/hyper-clipaudio.service << EOL
+[Unit]
+Description=Unified Clipboard and Audio Server
+After=network.target sound.target
+Wants=network.target sound.target
+
+[Service]
+Type=simple
+User=${ACTUAL_USER}
+Group=audio
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=${USER_HOME}/.Xauthority
+Environment=XDG_RUNTIME_DIR=/run/user/${USER_ID}
+Environment=HOME=${USER_HOME}
+Environment=PULSE_SERVER=unix:/run/user/${USER_ID}/pulse/native
+Environment=PULSE_RUNTIME_PATH=/run/user/${USER_ID}/pulse
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:${USER_HOME}/.local/bin
+Environment=PYTHONPATH=${USER_HOME}/.local/lib/python3.12/site-packages
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/opt/hyper-clipaudio
+
+ExecStartPre=/bin/mkdir -p /run/user/${USER_ID}/pulse
+ExecStartPre=/bin/chown -R ${ACTUAL_USER}:${ACTUAL_USER} /run/user/${USER_ID}
+ExecStartPre=/bin/chmod -R 700 /run/user/${USER_ID}
+ExecStart=/opt/hyper-clipaudio/run_server.sh
+
+Restart=always
+RestartSec=30
+StartLimitInterval=300
+StartLimitBurst=5
+
+StandardOutput=append:/var/log/hyper-clipaudio/stdout.log
+StandardError=append:/var/log/hyper-clipaudio/stderr.log
+
+[Install]
+WantedBy=multi-user.target
+EOL
+
+verify_file "/etc/systemd/system/hyper-clipaudio.service"
+
+# Set correct permissions
+print_status "Setting permissions..."
+chown -R $ACTUAL_USER:$ACTUAL_USER /opt/hyper-clipaudio
 chown -R $ACTUAL_USER:$ACTUAL_USER /var/log/hyper-clipaudio
 chown -R $ACTUAL_USER:$ACTUAL_USER /run/user/${USER_ID}
 chmod 755 /var/log/hyper-clipaudio
 chmod 700 /run/user/${USER_ID}
 
-[Previous service file and wrapper script creation remains the same...]
-
-# Add user to required groups WITHOUT logging out
-print_status "Setting up group permissions..."
-for group in audio pulse pulse-access; do
-    if ! echo $CURRENT_GROUPS | grep -q "\b$group\b"; then
-        usermod -a -G $group $ACTUAL_USER
-        print_warning "Added user to $group group"
-    fi
-done
-
-# Create a temporary group activation script
-print_status "Creating temporary group activation..."
-cat > /opt/hyper-clipaudio/activate_groups.sh << EOL
-#!/bin/bash
-exec sg audio -c "sg pulse -c \"sg pulse-access -c '/opt/hyper-clipaudio/run_server.sh'\""
-EOL
-
-chmod +x /opt/hyper-clipaudio/activate_groups.sh
-chown $ACTUAL_USER:$ACTUAL_USER /opt/hyper-clipaudio/activate_groups.sh
-
-# Update the service file to use the group activation script
-sed -i "s|ExecStart=.*|ExecStart=/opt/hyper-clipaudio/activate_groups.sh|" /etc/systemd/system/hyper-clipaudio.service
+# Add user to required groups
+print_status "Adding user to required groups..."
+usermod -a -G audio,pulse,pulse-access $ACTUAL_USER
 
 # Set up PulseAudio configuration
 print_status "Setting up PulseAudio configuration..."
-sudo -u $ACTUAL_USER mkdir -p ${USER_HOME}/.config/pulse
+mkdir -p ${USER_HOME}/.config/pulse
 cat > ${USER_HOME}/.config/pulse/client.conf << EOL
 autospawn = yes
 daemon-binary = /usr/bin/pulseaudio
 EOL
 chown -R $ACTUAL_USER:$ACTUAL_USER ${USER_HOME}/.config/pulse
 
-# Download the script
-print_status "Downloading latest version of the server script..."
-curl -s https://raw.githubusercontent.com/pentestfunctions/hyper-clipaudio/main/linux_listener.py > /opt/hyper-clipaudio/server.py || \
-    handle_error "Failed to download server script"
-
-chmod +x /opt/hyper-clipaudio/server.py
-chown -R $ACTUAL_USER:$ACTUAL_USER /opt/hyper-clipaudio
-
 # Reload systemd
 print_status "Reloading systemd daemon..."
 systemctl daemon-reload
 
-# Start service
-print_status "Starting service..."
+# Enable and start the service
+print_status "Enabling and starting service..."
 systemctl enable hyper-clipaudio
 systemctl start hyper-clipaudio
 
 # Wait for service to start
 sleep 3
 
+# Verify service creation and status
+if [ ! -f "/etc/systemd/system/hyper-clipaudio.service" ]; then
+    print_error "Service file was not created properly"
+    exit 1
+fi
+
 # Check service status
 if systemctl is-active --quiet hyper-clipaudio; then
     print_status "Service successfully started!"
-    print_status "You can check the status using: systemctl status hyper-clipaudio"
-    print_status "View logs using: journalctl -u hyper-clipaudio"
 else
     print_warning "Service failed to start. Checking logs..."
     journalctl -u hyper-clipaudio -n 50 --no-pager
 fi
 
 print_status "Installation complete!"
-print_status "You can manage the service using:"
+print_status "Service status:"
+systemctl status hyper-clipaudio
+
+print_warning "You can manage the service using:"
 echo "  systemctl status hyper-clipaudio    # Check status"
 echo "  systemctl restart hyper-clipaudio   # Restart service"
 echo "  journalctl -u hyper-clipaudio -f    # View logs"
@@ -198,7 +210,9 @@ echo ""
 print_status "Current port configuration:"
 echo "Audio Port: 5001"
 echo "Clipboard Port: 12345"
-echo ""
-print_warning "Make sure these ports are allowed through your firewall!"
-print_warning "NOTE: Group changes have been applied but will take full effect after your next login"
-print_warning "The service will work now, but for complete functionality, consider logging out and back in when convenient"
+
+print_warning "If the service isn't working correctly, try:"
+echo "1. Check service status: systemctl status hyper-clipaudio"
+echo "2. View logs: journalctl -u hyper-clipaudio -f"
+echo "3. Check log files in /var/log/hyper-clipaudio/"
+echo "4. Consider logging out and back in for group changes to take effect"
