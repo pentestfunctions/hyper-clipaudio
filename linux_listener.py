@@ -5,112 +5,23 @@ import base64
 import subprocess
 import threading
 import os
+import pyaudio
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import time
 from datetime import datetime
 import traceback
-import signal
-import sys
-import pyaudio
-
-# Add debug flag
-DEBUG = True
 
 # Configuration
 CHUNK = 1024
-FORMAT = None  # Will be set after PyAudio import
+FORMAT = pyaudio.paInt16
 CHANNELS = 2
 RATE = 44100
 HOST = '0.0.0.0'
 CLIPBOARD_PORT = 12345
 AUDIO_PORT = 5001
 MAX_CLIENTS = 50
-
-def setup_debug_logging():
-    """Set up detailed debug logging"""
-    log_dir = Path('/var/log/hyper-clipaudio')
-    log_dir.mkdir(exist_ok=True, parents=True)
-    
-    debug_log = log_dir / 'debug.log'
-    handler = RotatingFileHandler(
-        debug_log,
-        maxBytes=5*1024*1024,
-        backupCount=5
-    )
-    
-    formatter = logging.Formatter(
-        '%(asctime)s - %(levelname)s - [%(threadName)s] %(message)s\n'
-        'File "%(pathname)s", line %(lineno)d, in %(funcName)s\n'
-        '%(message)s\n',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    
-    handler.setFormatter(formatter)
-    logger = logging.getLogger()
-    logger.addHandler(handler)
-    logger.setLevel(logging.DEBUG if DEBUG else logging.INFO)
-    
-    # Log system information
-    logging.debug("Starting with system information:")
-    logging.debug(f"Python version: {sys.version}")
-    logging.debug(f"Current working directory: {os.getcwd()}")
-    logging.debug(f"User: {os.getenv('USER')}")
-    logging.debug(f"DISPLAY: {os.getenv('DISPLAY')}")
-    logging.debug(f"XAUTHORITY: {os.getenv('XAUTHORITY')}")
-    logging.debug(f"XDG_RUNTIME_DIR: {os.getenv('XDG_RUNTIME_DIR')}")
-    logging.debug(f"PULSE_SERVER: {os.getenv('PULSE_SERVER')}")
-
-def check_dependencies():
-    """Check all required dependencies"""
-    try:
-        import pyaudio
-        global FORMAT
-        FORMAT = pyaudio.paInt16
-        logging.debug("PyAudio imported successfully")
-        
-        # Test PyAudio initialization
-        p = pyaudio.PyAudio()
-        device_count = p.get_device_count()
-        logging.debug(f"Found {device_count} audio devices:")
-        
-        # Log all audio devices
-        for i in range(device_count):
-            try:
-                device_info = p.get_device_info_by_index(i)
-                logging.debug(f"Device {i}: {device_info}")
-            except Exception as e:
-                logging.error(f"Error getting device {i} info: {e}")
-        
-        p.terminate()
-        
-    except ImportError as e:
-        logging.error(f"Failed to import PyAudio: {e}")
-        sys.exit(1)
-    
-    # Check xsel is installed
-    try:
-        subprocess.run(['xsel', '--version'], capture_output=True, check=True)
-        logging.debug("xsel is available")
-    except subprocess.CalledProcessError as e:
-        logging.error(f"xsel test failed: {e}")
-        sys.exit(1)
-    except FileNotFoundError:
-        logging.error("xsel not found")
-        sys.exit(1)
-
-def test_x11_access():
-    """Test X11 access"""
-    try:
-        subprocess.run(['xset', 'q'], capture_output=True, check=True)
-        logging.debug("X11 access test passed")
-    except subprocess.CalledProcessError as e:
-        logging.error(f"X11 access test failed: {e}")
-        sys.exit(1)
-    except FileNotFoundError:
-        logging.error("xset not found")
-        sys.exit(1)
 
 class ServerStats:
     def __init__(self):
@@ -498,45 +409,6 @@ class UnifiedServer:
             
             logging.info("Unified Server shutdown complete")
 
-def main():
-    setup_debug_logging()
-    logging.info("Starting server initialization")
-    server = None
-    
-    try:
-        # Initial checks
-        check_dependencies()
-        test_x11_access()
-        
-        # Server initialization
-        logging.info("Creating UnifiedServer instance")
-        server = UnifiedServer()
-        
-        # Register signal handlers before starting
-        signal.signal(signal.SIGTERM, lambda signo, frame: handle_shutdown(signo, frame, server))
-        signal.signal(signal.SIGINT, lambda signo, frame: handle_shutdown(signo, frame, server))
-        
-        # Start the server
-        logging.info("Starting UnifiedServer")
-        server.start()
-        
-    except KeyboardInterrupt:
-        logging.info("Received keyboard interrupt")
-        if server:
-            server.cleanup()
-    except Exception as e:
-        logging.error(f"Fatal error during startup: {e}")
-        logging.error(traceback.format_exc())
-        if server:
-            server.cleanup()
-        sys.exit(1)
-
-def handle_shutdown(signo, frame, server):
-    """Handle shutdown signals"""
-    logging.info(f"Received signal {signo}")
-    if server:
-        server.cleanup()
-    sys.exit(0)
-
 if __name__ == "__main__":
-    main()
+    server = UnifiedServer()
+    server.start()
