@@ -99,38 +99,56 @@ function Test-StreamConnection {
     }
 }
 
-function Start-AudioStream {
-    param($StreamUrl)
-    Write-VerboseOutput "Attempting to start stream from: $StreamUrl"
+function Start-PersistentAudioStream {
+    param($ServerIP, $AudioPort, $VLCPath)
     
-    try {
-        $vlcArgs = @(
-            "--intf", "dummy",
-            "--no-video",
-            "--demux", "rawaud",
-            "--rawaud-channels", "2",
-            "--rawaud-samplerate", "44100",
-            "--rawaud-fourcc", "s16l",
-            "--network-caching", "50",
-            "--live-caching", "50",
-            "--sout-mux-caching", "50",
-            $StreamUrl
-        )
+    Start-Job -ScriptBlock {
+        param($ServerIP, $AudioPort, $VLCPath)
         
-        $process = Start-Process -FilePath $vlcPath -ArgumentList $vlcArgs -PassThru
-        Write-VerboseOutput "VLC started with PID: $($process.Id)"
+        $streamUrl = "tcp://${ServerIP}:${AudioPort}"
+        $reconnectDelay = 1
         
-        Start-Sleep -Seconds 2
-        if ($process.HasExited) {
-            Write-Host "VLC process terminated unexpectedly. Exit code: $($process.ExitCode)"
-            return $false
+        while ($true) {
+            try {
+                # Test connection before starting VLC
+                $testConnection = Test-NetConnection -ComputerName $ServerIP -Port $AudioPort -WarningAction SilentlyContinue
+                
+                if ($testConnection.TcpTestSucceeded) {
+                    $vlcArgs = @(
+                        "--intf", "dummy",
+                        "--no-video",
+                        "--demux", "rawaud",
+                        "--rawaud-channels", "2",
+                        "--rawaud-samplerate", "44100",
+                        "--rawaud-fourcc", "s16l",
+                        "--network-caching", "50",
+                        "--live-caching", "50",
+                        "--sout-mux-caching", "50",
+                        $streamUrl
+                    )
+                    
+                    $process = Start-Process -FilePath $VLCPath -ArgumentList $vlcArgs -PassThru -NoNewWindow
+                    
+                    # Monitor the VLC process
+                    while (!$process.HasExited) {
+                        Start-Sleep -Seconds 1
+                        $testConnection = Test-NetConnection -ComputerName $ServerIP -Port $AudioPort -WarningAction SilentlyContinue
+                        if (!$testConnection.TcpTestSucceeded) {
+                            $process.Kill()
+                            break
+                        }
+                    }
+                }
+            }
+            catch {
+                Write-Host "Audio connection error: $_"
+            }
+            
+            # Cleanup and wait before retry
+            Get-Process vlc -ErrorAction SilentlyContinue | Where-Object { $_.Id -eq $process.Id } | Stop-Process -Force
+            Start-Sleep -Seconds $reconnectDelay
         }
-        
-        return $true
-    } catch {
-        Write-Host "Failed to start VLC: $_"
-        return $false
-    }
+    } -ArgumentList $ServerIP, $AudioPort, $VLCPath
 }
 
 function Kill-AllVLC {
@@ -396,26 +414,8 @@ function Show-MainForm {
             return
         }
 
-        # Start audio stream in a background job
-        $streamUrl = "tcp://${ServerIP}:${audioPort}"
-        $script:audioJob = Start-Job -ScriptBlock {
-            param($VLCPath, $StreamUrl)
-            
-            $vlcArgs = @(
-                "--intf", "dummy",
-                "--no-video",
-                "--demux", "rawaud",
-                "--rawaud-channels", "2",
-                "--rawaud-samplerate", "44100",
-                "--rawaud-fourcc", "s16l",
-                "--network-caching", "50",
-                "--live-caching", "50",
-                "--sout-mux-caching", "50",
-                $StreamUrl
-            )
-            
-            Start-Process -FilePath $VLCPath -ArgumentList $vlcArgs -NoNewWindow -Wait
-        } -ArgumentList $vlcPath, $streamUrl
+        # Start persistent audio stream
+        $script:audioJob = Start-PersistentAudioStream -ServerIP $ServerIP -AudioPort $audioPort -VLCPath $vlcPath
 
         # Start clipboard sync in a separate runspace
         $script:runspace = [runspacefactory]::CreateRunspace()
@@ -430,7 +430,7 @@ function Show-MainForm {
         
         $script:powershell = [powershell]::Create().AddScript({
             param($ServerIP, $ClipboardPort, $SyncDir)
-            
+
             Add-Type -AssemblyName System.Windows.Forms
 
             function Write-DebugLog {
@@ -479,10 +479,10 @@ function Show-MainForm {
             $lastUpdate = Get-Date
             $updateThreshold = [TimeSpan]::FromMilliseconds(500)
             $client = $null
-            $reconnectDelay = 5
-            
+            $reconnectDelay = 2
+
             Write-DebugLog "Starting clipboard sync with server $ServerIP`:$ClipboardPort" "INFO"
-            
+
             try {
                 while ($true) {
                     try {
