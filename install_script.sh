@@ -1,321 +1,549 @@
-#!/bin/bash
+#!/usr/bin/env python3
+import socket
+import json
+import base64
+import subprocess
+import threading
+import os
+import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+import time
+from datetime import datetime
+import traceback
+import signal
+import sys
+import pyaudio
 
-# Colors for pretty output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+# Add debug flag
+DEBUG = True
 
-# Function to print colored status messages
-print_status() {
-    echo -e "${GREEN}[+]${NC} $1"
-}
+# Configuration
+CHUNK = 1024
+FORMAT = None  # Will be set after PyAudio import
+CHANNELS = 2
+RATE = 44100
+HOST = '0.0.0.0'
+CLIPBOARD_PORT = 12345
+AUDIO_PORT = 5001
+MAX_CLIENTS = 50
 
-print_error() {
-    echo -e "${RED}[!]${NC} $1"
-}
-
-print_warning() {
-    echo -e "${YELLOW}[*]${NC} $1"
-}
-
-# Function to handle errors
-handle_error() {
-    print_error "$1"
-    print_error "Installation failed!"
-    exit 1
-}
-
-# Function to verify file creation
-verify_file() {
-    if [ ! -f "$1" ]; then
-        handle_error "Failed to create file: $1"
-    fi
-    print_status "Successfully created: $1"
-}
-
-# Check if script is run as root
-if [ "$EUID" -ne 0 ]; then
-    handle_error "Please run as root"
-fi
-
-# Get the actual user who ran the script with sudo
-ACTUAL_USER=$(who am i | awk '{print $1}')
-if [ -z "$ACTUAL_USER" ]; then
-    ACTUAL_USER=$SUDO_USER
-fi
-
-if [ -z "$ACTUAL_USER" ]; then
-    handle_error "Could not determine the actual user"
-fi
-
-USER_ID=$(id -u $ACTUAL_USER)
-USER_HOME=$(eval echo ~$ACTUAL_USER)
-
-print_status "Installing for user: $ACTUAL_USER (UID: $USER_ID)"
-
-# Stop any existing processes and clean up
-print_status "Cleaning up existing installation..."
-systemctl stop hyper-clipaudio 2>/dev/null || true
-systemctl disable hyper-clipaudio 2>/dev/null || true
-rm -f /etc/systemd/system/hyper-clipaudio.service
-systemctl daemon-reload
-systemctl reset-failed
-
-# Stop any existing PulseAudio instances
-sudo -u $ACTUAL_USER pkill pulseaudio || true
-sleep 2
-
-# Install required packages
-print_status "Installing required packages..."
-pacman -Sq --noconfirm python python-pip xsel pulseaudio pulseaudio-alsa alsa-utils portaudio || \
-    handle_error "Failed to install required packages"
-
-# Install PyAudio using pip
-print_status "Installing PyAudio using pip..."
-sudo -u $ACTUAL_USER pip install --user pyaudio || \
-    handle_error "Failed to install PyAudio"
-
-# Create required directories
-print_status "Creating required directories..."
-mkdir -p /opt/hyper-clipaudio
-mkdir -p /var/log/hyper-clipaudio
-mkdir -p /run/user/${USER_ID}/pulse
-chown -R $ACTUAL_USER:$ACTUAL_USER /var/log/hyper-clipaudio
-chown -R $ACTUAL_USER:$ACTUAL_USER /run/user/${USER_ID}
-chmod 755 /var/log/hyper-clipaudio
-chmod 700 /run/user/${USER_ID}
-
-# Create ALSA configuration
-print_status "Setting up ALSA configuration..."
-cat > /etc/asound.conf << EOL
-defaults.pcm.card 0
-defaults.ctl.card 0
-pcm.pulse {
-    type pulse
-}
-ctl.pulse {
-    type pulse
-}
-pcm.!default {
-    type pulse
-}
-ctl.!default {
-    type pulse
-}
-EOL
-
-# Create PulseAudio configuration
-print_status "Setting up PulseAudio configuration..."
-sudo -u $ACTUAL_USER mkdir -p ${USER_HOME}/.config/pulse
-cat > ${USER_HOME}/.config/pulse/client.conf << EOL
-autospawn = yes
-daemon-binary = /usr/bin/pulseaudio
-EOL
-chown -R $ACTUAL_USER:$ACTUAL_USER ${USER_HOME}/.config/pulse
-
-cat > ${USER_HOME}/.config/pulse/daemon.conf << EOL
-daemonize = yes
-allow-module-loading = yes
-allow-exit = yes
-resample-method = speex-float-1
-enable-remixing = yes
-enable-lfe-remixing = no
-flat-volumes = no
-EOL
-
-# Download the server script
-print_status "Downloading server script..."
-curl -s https://raw.githubusercontent.com/pentestfunctions/hyper-clipaudio/main/linux_listener.py > /opt/hyper-clipaudio/server.py || \
-    handle_error "Failed to download server script"
-chmod +x /opt/hyper-clipaudio/server.py
-verify_file "/opt/hyper-clipaudio/server.py"
-
-# Create wrapper script
-print_status "Creating wrapper script..."
-cat > /opt/hyper-clipaudio/run_server.sh << 'EOL'
-#!/bin/bash
-
-# Log function
-log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a /var/log/hyper-clipaudio/debug.log
-}
-
-# Ensure log directory exists
-mkdir -p /var/log/hyper-clipaudio
-
-log "Starting server wrapper"
-
-# Function to check PulseAudio status
-check_pulseaudio() {
-    # Try to get PulseAudio info
-    if pactl info >/dev/null 2>&1; then
-        return 0  # PulseAudio is running
-    else
-        return 1  # PulseAudio is not running
-    fi
-}
-
-# Initialize PulseAudio
-log "Initializing PulseAudio..."
-
-# Kill any existing PulseAudio processes
-pulseaudio -k || true
-sleep 1
-
-# Start PulseAudio with specific configuration
-pulseaudio --start --log-target=syslog --exit-idle-time=-1 --daemon 2>&1 | while read -r line; do
-    log "PulseAudio: $line"
-done
-
-# Wait for PulseAudio to initialize
-sleep 2
-
-# Verify PulseAudio is working
-retry_count=0
-max_retries=5
-while ! check_pulseaudio && [ $retry_count -lt $max_retries ]; do
-    log "Waiting for PulseAudio to start (attempt $((retry_count + 1))/$max_retries)..."
-    sleep 2
-    retry_count=$((retry_count + 1))
-done
-
-if check_pulseaudio; then
-    log "PulseAudio is operational"
-else
-    log "Failed to initialize PulseAudio after $max_retries attempts"
-    exit 1
-fi
-
-# Load required PulseAudio modules
-pactl load-module module-null-sink sink_name=virtual_speaker sink_properties=device.description=Virtual_Speaker || log "Warning: Failed to load null-sink module"
-pactl load-module module-virtual-source source_name=virtual_mic || log "Warning: Failed to load virtual-source module"
-
-# List audio devices
-log "Available audio devices:"
-pactl list short sources || log "No audio sources found"
-pactl list short sinks || log "No audio sinks found"
-
-# Start the server
-log "Starting Python server..."
-exec python /opt/hyper-clipaudio/server.py 2>&1
-EOL
-
-chmod +x /opt/hyper-clipaudio/run_server.sh
-verify_file "/opt/hyper-clipaudio/run_server.sh"
-
-# Create systemd service file
-print_status "Creating systemd service file..."
-cat > /etc/systemd/system/hyper-clipaudio.service << EOL
-[Unit]
-Description=Unified Clipboard and Audio Server
-After=network.target sound.target
-Wants=network.target sound.target
-
-[Service]
-Type=simple
-User=${ACTUAL_USER}
-Group=audio
-RuntimeDirectory=hyper-clipaudio
-RuntimeDirectoryMode=0755
-
-Environment=DISPLAY=:0
-Environment=XAUTHORITY=${USER_HOME}/.Xauthority
-Environment=XDG_RUNTIME_DIR=/run/user/${USER_ID}
-Environment=HOME=${USER_HOME}
-Environment=PULSE_SERVER=unix:/run/user/${USER_ID}/pulse/native
-Environment=PULSE_RUNTIME_PATH=/run/user/${USER_ID}/pulse
-Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:${USER_HOME}/.local/bin
-Environment=PYTHONPATH=${USER_HOME}/.local/lib/python3.12/site-packages
-Environment=PYTHONUNBUFFERED=1
-
-WorkingDirectory=/opt/hyper-clipaudio
-
-# Set up runtime directory
-ExecStartPre=/bin/sh -c 'mkdir -p /run/user/${USER_ID}/pulse'
-ExecStartPre=/bin/sh -c 'chown ${ACTUAL_USER}:${ACTUAL_USER} /run/user/${USER_ID}/pulse'
-ExecStartPre=/bin/sh -c 'chmod 700 /run/user/${USER_ID}/pulse'
-
-ExecStart=/opt/hyper-clipaudio/run_server.sh
-
-Restart=on-failure
-RestartSec=30
-StartLimitInterval=300
-StartLimitBurst=5
-
-StandardOutput=append:/var/log/hyper-clipaudio/stdout.log
-StandardError=append:/var/log/hyper-clipaudio/stderr.log
-
-[Install]
-WantedBy=multi-user.target
-EOL
-
-verify_file "/etc/systemd/system/hyper-clipaudio.service"
-
-# Set permissions
-print_status "Setting permissions..."
-chown -R $ACTUAL_USER:$ACTUAL_USER /opt/hyper-clipaudio
-chmod -R 755 /opt/hyper-clipaudio
-
-# Add user to required groups
-print_status "Adding user to required groups..."
-usermod -a -G audio,pulse,pulse-access $ACTUAL_USER
-
-# Create PulseAudio socket directory with correct permissions
-mkdir -p /run/user/${USER_ID}/pulse
-chown -R $ACTUAL_USER:$ACTUAL_USER /run/user/${USER_ID}
-chmod -R 700 /run/user/${USER_ID}
-
-# Ensure ALSA modules are loaded
-print_status "Loading ALSA modules..."
-modprobe snd-seq || print_warning "Failed to load snd-seq module"
-modprobe snd-pcm || print_warning "Failed to load snd-pcm module"
-
-# Reload systemd and start service
-print_status "Starting service..."
-systemctl daemon-reload
-systemctl enable hyper-clipaudio
-systemctl start hyper-clipaudio
-
-# Wait for service to initialize
-sleep 3
-
-# Verify service
-if systemctl is-active --quiet hyper-clipaudio; then
-    print_status "Service successfully started!"
-    systemctl status hyper-clipaudio
-else
-    print_warning "Service failed to start. Checking logs..."
-    journalctl -u hyper-clipaudio -n 50 --no-pager
+def setup_debug_logging():
+    """Set up detailed debug logging"""
+    log_dir = Path('/var/log/hyper-clipaudio')
+    log_dir.mkdir(exist_ok=True, parents=True)
     
-    print_warning "Attempting to diagnose issues..."
-    print_status "PulseAudio status:"
-    sudo -u $ACTUAL_USER pulseaudio --check || echo "PulseAudio not running"
+    debug_log = log_dir / 'debug.log'
+    handler = RotatingFileHandler(
+        debug_log,
+        maxBytes=5*1024*1024,
+        backupCount=5
+    )
     
-    print_status "ALSA devices:"
-    aplay -l || echo "No ALSA devices found"
+    formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - [%(threadName)s] %(message)s\n'
+        'File "%(pathname)s", line %(lineno)d, in %(funcName)s\n'
+        '%(message)s\n',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
     
-    print_status "PulseAudio devices:"
-    sudo -u $ACTUAL_USER pactl list || echo "No PulseAudio devices found"
-fi
+    handler.setFormatter(formatter)
+    logger = logging.getLogger()
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG if DEBUG else logging.INFO)
+    
+    # Log system information
+    logging.debug("Starting with system information:")
+    logging.debug(f"Python version: {sys.version}")
+    logging.debug(f"Current working directory: {os.getcwd()}")
+    logging.debug(f"User: {os.getenv('USER')}")
+    logging.debug(f"DISPLAY: {os.getenv('DISPLAY')}")
+    logging.debug(f"XAUTHORITY: {os.getenv('XAUTHORITY')}")
+    logging.debug(f"XDG_RUNTIME_DIR: {os.getenv('XDG_RUNTIME_DIR')}")
+    logging.debug(f"PULSE_SERVER: {os.getenv('PULSE_SERVER')}")
 
-print_status "Installation complete!"
-echo ""
-print_status "Service management commands:"
-echo "  systemctl status hyper-clipaudio    # Check status"
-echo "  systemctl restart hyper-clipaudio   # Restart service"
-echo "  journalctl -u hyper-clipaudio -f    # View logs"
-echo ""
-print_status "Port configuration:"
-echo "  Audio Port: 5001"
-echo "  Clipboard Port: 12345"
-echo ""
-print_warning "Troubleshooting steps if needed:"
-echo "1. Check service status: systemctl status hyper-clipaudio"
-echo "2. View logs: journalctl -u hyper-clipaudio -f"
-echo "3. Check debug log: cat /var/log/hyper-clipaudio/debug.log"
-echo "4. Test audio: pactl list sources"
-echo "5. Try running manually: sudo -u $ACTUAL_USER /opt/hyper-clipaudio/run_server.sh"
-echo "6. If needed, restart PulseAudio: pulseaudio -k && pulseaudio --start"
-echo "7. Check ALSA configuration: cat /proc/asound/cards"
-echo "8. Verify runtime directory: ls -la /run/user/${USER_ID}/pulse"
+def check_dependencies():
+    """Check all required dependencies"""
+    try:
+        import pyaudio
+        global FORMAT
+        FORMAT = pyaudio.paInt16
+        logging.debug("PyAudio imported successfully")
+        
+        # Test PyAudio initialization
+        p = pyaudio.PyAudio()
+        device_count = p.get_device_count()
+        logging.debug(f"Found {device_count} audio devices:")
+        
+        # Log all audio devices
+        for i in range(device_count):
+            try:
+                device_info = p.get_device_info_by_index(i)
+                logging.debug(f"Device {i}: {device_info}")
+            except Exception as e:
+                logging.error(f"Error getting device {i} info: {e}")
+        
+        p.terminate()
+        
+    except ImportError as e:
+        logging.error(f"Failed to import PyAudio: {e}")
+        sys.exit(1)
+    
+    # Check xsel is installed
+    try:
+        subprocess.run(['xsel', '--version'], capture_output=True, check=True)
+        logging.debug("xsel is available")
+    except subprocess.CalledProcessError as e:
+        logging.error(f"xsel test failed: {e}")
+        sys.exit(1)
+    except FileNotFoundError:
+        logging.error("xsel not found")
+        sys.exit(1)
+
+def test_x11_access():
+    """Test X11 access"""
+    try:
+        subprocess.run(['xset', 'q'], capture_output=True, check=True)
+        logging.debug("X11 access test passed")
+    except subprocess.CalledProcessError as e:
+        logging.error(f"X11 access test failed: {e}")
+        sys.exit(1)
+    except FileNotFoundError:
+        logging.error("xset not found")
+        sys.exit(1)
+
+class ServerStats:
+    def __init__(self):
+        self.start_time = datetime.now()
+        self.audio_clients = 0
+        self.clipboard_clients = 0
+        self.peak_audio_clients = 0
+        self.peak_clipboard_clients = 0
+        self._lock = threading.Lock()
+
+    def update_clients(self, audio_count=None, clipboard_count=None):
+        with self._lock:
+            if audio_count is not None:
+                self.audio_clients = audio_count
+                self.peak_audio_clients = max(self.peak_audio_clients, audio_count)
+            if clipboard_count is not None:
+                self.clipboard_clients = clipboard_count
+                self.peak_clipboard_clients = max(self.peak_clipboard_clients, clipboard_count)
+
+    def get_stats(self) -> dict:
+        with self._lock:
+            return {
+                'uptime': str(datetime.now() - self.start_time),
+                'current_audio_clients': self.audio_clients,
+                'peak_audio_clients': self.peak_audio_clients,
+                'current_clipboard_clients': self.clipboard_clients,
+                'peak_clipboard_clients': self.peak_clipboard_clients
+            }
+
+class AudioServer:
+    def __init__(self, stats, host='0.0.0.0', port=AUDIO_PORT):
+        self.host = host
+        self.port = port
+        self.p = pyaudio.PyAudio()
+        self.clients = []
+        self.running = True
+        self.stats = stats
+        
+        # Open input stream for microphone capture
+        self.audio_stream = self.p.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=RATE,
+            input=True,
+            frames_per_buffer=CHUNK
+        )
+
+    def accept_clients(self, server_socket):
+        while self.running:
+            try:
+                client_socket, client_address = server_socket.accept()
+                logging.info(f"Audio Client {client_address} connected")
+                self.clients.append(client_socket)
+                self.stats.update_clients(audio_count=len(self.clients))
+            except Exception as e:
+                if self.running:
+                    logging.error(f"Error accepting audio client: {e}")
+
+    def stream_audio(self):
+        while self.running:
+            try:
+                audio_data = self.audio_stream.read(CHUNK, exception_on_overflow=False)
+                dead_clients = []
+                for client in self.clients:
+                    try:
+                        client.sendall(audio_data)
+                    except Exception as e:
+                        logging.error(f"Error sending audio to client: {e}")
+                        dead_clients.append(client)
+
+                for client in dead_clients:
+                    self.clients.remove(client)
+                    self.stats.update_clients(audio_count=len(self.clients))
+                    try:
+                        client.close()
+                    except:
+                        pass
+            except Exception as e:
+                logging.error(f"Audio streaming error: {e}")
+                break
+
+    def start(self):
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind((self.host, self.port))
+        server_socket.listen(MAX_CLIENTS)
+        logging.info(f"Audio Server listening on {self.host}:{self.port}")
+
+        accept_thread = threading.Thread(
+            target=self.accept_clients,
+            args=(server_socket,),
+            name="AudioAcceptor"
+        )
+        accept_thread.daemon = True
+        accept_thread.start()
+
+        stream_thread = threading.Thread(
+            target=self.stream_audio,
+            name="AudioStreamer"
+        )
+        stream_thread.daemon = True
+        stream_thread.start()
+
+        return server_socket
+
+    def stop(self):
+        self.running = False
+        for client in self.clients:
+            try:
+                client.close()
+            except:
+                pass
+        self.audio_stream.stop_stream()
+        self.audio_stream.close()
+        self.p.terminate()
+
+class ClipboardServer:
+    def __init__(self, stats, host='0.0.0.0', port=CLIPBOARD_PORT):
+        self.host = host
+        self.port = port
+        self.last_content = None
+        self.last_update = time.time()
+        self.update_threshold = 0.5
+        self.running = True
+        self.stats = stats
+        
+        self.sync_dir = Path.home() / "ClipboardSync"
+        self.sync_dir.mkdir(exist_ok=True)
+        logging.info(f"Using sync directory: {self.sync_dir}")
+        
+        self.clients = set()
+        self.clients_lock = threading.Lock()
+
+    def get_clipboard(self):
+        try:
+            content = subprocess.run(
+                ['xsel', '--clipboard', '--output'],
+                capture_output=True,
+                text=True,
+                check=True
+            ).stdout
+            return content.strip() if content else None
+        except Exception as e:
+            logging.error(f"Failed to get clipboard: {e}")
+            return None
+
+    def set_clipboard(self, text):
+        if not isinstance(text, str):
+            text = str(text)
+        try:
+            process = subprocess.Popen(['xsel', '--clipboard', '--input'], stdin=subprocess.PIPE)
+            process.communicate(input=text.encode())
+            process = subprocess.Popen(['xsel', '--primary', '--input'], stdin=subprocess.PIPE)
+            process.communicate(input=text.encode())
+            return True
+        except Exception as e:
+            logging.error(f"Error setting clipboard: {e}")
+            return False
+
+    def broadcast_to_clients(self, data, skip_client=None):
+        try:
+            json_str = json.dumps(data)
+            
+            with self.clients_lock:
+                disconnected = set()
+                for client in self.clients:
+                    if client == skip_client:
+                        continue
+                    try:
+                        message = json_str.encode() + b'\n'
+                        client.sendall(message)
+                        client.sendall(b'OK\n')
+                    except Exception as e:
+                        logging.error(f"Failed to send to client: {e}")
+                        disconnected.add(client)
+                
+                for client in disconnected:
+                    self.clients.discard(client)
+                    try:
+                        client.close()
+                    except:
+                        pass
+                
+                self.stats.update_clients(clipboard_count=len(self.clients))
+        except Exception as e:
+            logging.error(f"Broadcast error: {e}")
+
+    def handle_client(self, client_socket, address):
+        logging.info(f"New clipboard connection from {address}")
+        
+        with self.clients_lock:
+            self.clients.add(client_socket)
+            self.stats.update_clients(clipboard_count=len(self.clients))
+        
+        last_monitor_content = None
+        buffer = ""
+        
+        try:
+            while self.running:
+                current = self.get_clipboard()
+                if current and current != last_monitor_content:
+                    now = time.time()
+                    if (now - self.last_update) > self.update_threshold:
+                        data = {
+                            "type": "text",
+                            "content": current,
+                            "filename": "",
+                            "timestamp": time.strftime('%Y-%m-%dT%H:%M:%S%z')
+                        }
+                        self.broadcast_to_clients(data)
+                        last_monitor_content = current
+                        self.last_update = now
+                
+                client_socket.settimeout(0.1)
+                try:
+                    data = client_socket.recv(4096)
+                    if not data:
+                        raise ConnectionError("Client disconnected")
+                    
+                    chunk = data.decode()
+                    buffer += chunk
+                    
+                    while '\n' in buffer:
+                        line, buffer = buffer.split('\n', 1)
+                        line = line.strip()
+                        if line and line != "OK":
+                            try:
+                                data = json.loads(line)
+                                content = data.get("content", "")
+                                
+                                if data.get("type") == "file":
+                                    file_path = self.sync_dir / data["filename"]
+                                    file_content = base64.b64decode(data["content"])
+                                    with open(file_path, 'wb') as f:
+                                        f.write(file_content)
+                                    self.set_clipboard(str(file_path))
+                                else:
+                                    self.set_clipboard(content)
+                                    self.broadcast_to_clients(data, skip_client=client_socket)
+                                
+                                client_socket.sendall(b'OK\n')
+                                self.last_update = time.time()
+                                last_monitor_content = content
+                                
+                            except json.JSONDecodeError as e:
+                                logging.error(f"JSON decode error: {e}")
+                            except Exception as e:
+                                logging.error(f"Error processing data: {e}")
+                        
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    logging.error(f"Client error: {e}")
+                    raise
+                    
+        except Exception as e:
+            logging.error(f"Clipboard client error: {e}")
+        finally:
+            with self.clients_lock:
+                self.clients.discard(client_socket)
+                self.stats.update_clients(clipboard_count=len(self.clients))
+            try:
+                client_socket.close()
+            except:
+                pass
+
+    def start(self):
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind((self.host, self.port))
+        server_socket.listen(MAX_CLIENTS)
+        logging.info(f"Clipboard Server listening on {self.host}:{self.port}")
+
+        def accept_clients():
+            while self.running:
+                try:
+                    client_socket, address = server_socket.accept()
+                    thread = threading.Thread(
+                        target=self.handle_client,
+                        args=(client_socket, address),
+                        name=f"ClipboardClient-{address}",
+                        daemon=True
+                    )
+                    thread.start()
+                except Exception as e:
+                    if self.running:
+                        logging.error(f"Error accepting clipboard client: {e}")
+
+        accept_thread = threading.Thread(target=accept_clients, name="ClipboardAcceptor", daemon=True)
+        accept_thread.start()
+
+        return server_socket
+
+    def stop(self):
+        self.running = False
+        with self.clients_lock:
+            for client in self.clients:
+                try:
+                    client.close()
+                except:
+                    pass
+
+class UnifiedServer:
+    def __init__(self):
+        self.setup_logging()
+        self.stats = ServerStats()
+        self.audio_server = AudioServer(self.stats)
+        self.clipboard_server = ClipboardServer(self.stats)
+        self.running = False
+
+    def setup_logging(self):
+        log_dir = Path.home() / 'UnifiedServer' / 'logs'
+        log_dir.mkdir(exist_ok=True, parents=True)
+        
+        log_file = log_dir / f"server_{datetime.now().strftime('%Y%m%d')}.log"
+        handler = RotatingFileHandler(
+            log_file,
+            maxBytes=5*1024*1024,
+            backupCount=5
+        )
+        
+        formatter = logging.Formatter(
+            '%(asctime)s - %(levelname)s - [%(threadName)s] %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        
+        handler.setFormatter(formatter)
+        logger = logging.getLogger()
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+        
+        logging.info("Unified Server logging initialized")
+
+    def log_server_stats(self):
+        while self.running:
+            stats = self.stats.get_stats()
+            logging.info("Server Statistics:")
+            for key, value in stats.items():
+                logging.info(f"  {key}: {value}")
+            time.sleep(300)  # Log every 5 minutes
+
+    def start(self):
+        self.running = True
+        
+        # Start stats logging
+        stats_thread = threading.Thread(
+            target=self.log_server_stats,
+            name="StatsLogger"
+        )
+        stats_thread.daemon = True
+        stats_thread.start()
+
+        try:
+            # Start both servers
+            audio_socket = self.audio_server.start()
+            clipboard_socket = self.clipboard_server.start()
+
+            logging.info(f"Unified Server running:")
+            logging.info(f"  Audio Server: {HOST}:{AUDIO_PORT}")
+            logging.info(f"  Clipboard Server: {HOST}:{CLIPBOARD_PORT}")
+
+            # Keep main thread alive
+            while self.running:
+                time.sleep(1)
+
+        except KeyboardInterrupt:
+            logging.info("Shutting down unified server...")
+        except Exception as e:
+            logging.error(f"Server error: {e}")
+            logging.debug(traceback.format_exc())
+        finally:
+            self.running = False
+            self.audio_server.stop()
+            self.clipboard_server.stop()
+            
+            try:
+                audio_socket.close()
+                clipboard_socket.close()
+            except:
+                pass
+            
+            logging.info("Unified Server shutdown complete")
+
+def handle_shutdown(signo, frame, server):
+    """Handle shutdown signals"""
+    logging.info(f"Received signal {signo}")
+    if server and server.running:
+        server.running = False
+        server.audio_server.stop()
+        server.clipboard_server.stop()
+        logging.info("Server shutdown complete")
+    sys.exit(0)
+
+def main():
+    setup_debug_logging()
+    logging.info("Starting server initialization")
+    server = None
+    
+    try:
+        # Initial checks
+        check_dependencies()
+        test_x11_access()
+        
+        # Server initialization
+        logging.info("Creating UnifiedServer instance")
+        server = UnifiedServer()
+        
+        # Register signal handlers before starting
+        def handle_term(signo, frame):
+            handle_shutdown(signo, frame, server)
+        
+        signal.signal(signal.SIGTERM, handle_term)
+        signal.signal(signal.SIGINT, handle_term)
+        
+        # Start the server
+        logging.info("Starting UnifiedServer")
+        server.start()
+        
+    except KeyboardInterrupt:
+        logging.info("Received keyboard interrupt")
+        if server and server.running:
+            server.running = False
+            server.audio_server.stop()
+            server.clipboard_server.stop()
+    except Exception as e:
+        logging.error(f"Fatal error during startup: {e}")
+        logging.error(traceback.format_exc())
+        if server and server.running:
+            server.running = False
+            server.audio_server.stop()
+            server.clipboard_server.stop()
+        sys.exit(1)
